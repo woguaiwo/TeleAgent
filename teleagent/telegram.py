@@ -1322,12 +1322,14 @@ class TelegramBridge:
         self._sent_menu_fingerprint = menu.fingerprint
         lines = [
             menu.title,
+            "",
             "回复数字选择；发送 /key up、/key down、/key enter 可手动控制。",
+            "",
         ]
         for index, option in enumerate(menu.options, start=1):
             marker = " *" if index - 1 == menu.selected_index else ""
             lines.append(f"{index}. {option}{marker}")
-        self._send_to_allowed_chats("\n".join(lines))
+        self._send_to_allowed_chats("\n".join(lines), structured=True)
         return True
 
     def _remove_injected_prompt_echoes(self, text: str) -> str:
@@ -1635,9 +1637,11 @@ def _extract_selection_menu_from_visible(visible: str, raw_text: str) -> Selecti
     options: list[str] = []
     selected_index: int | None = None
     candidate_lines = lines[-30:]
-    kimi_sessions_menu = _extract_kimi_sessions_menu(lines)
+    kimi_sessions_menu = _extract_kimi_sessions_menu(lines, raw_text=raw_text)
     if kimi_sessions_menu is not None:
         return kimi_sessions_menu
+    if _has_kimi_sessions_context(lines, raw_text):
+        return None
     menu_context = _has_selection_menu_context(candidate_lines)
     terminal_context = _has_terminal_control_context(raw_text)
     selected_line_positions: list[int] = []
@@ -1700,11 +1704,23 @@ def _extract_selection_menu_from_visible(visible: str, raw_text: str) -> Selecti
     return SelectionMenu(title=title, options=tuple(options), selected_index=selected_index)
 
 
-def _extract_kimi_sessions_menu(lines: list[str]) -> SelectionMenu | None:
+def _extract_kimi_sessions_menu(
+    lines: list[str],
+    *,
+    raw_text: str = "",
+) -> SelectionMenu | None:
     normalized = [_normalize_menu_line(line) for line in lines]
     normalized = [line for line in normalized if line]
     if not normalized:
         return None
+    expected_count = _kimi_sessions_expected_count(normalized)
+    if expected_count is None and raw_text:
+        expected_count = _kimi_sessions_expected_count(
+            [
+                _normalize_menu_line(line)
+                for line in _visible_terminal_text(raw_text).splitlines()
+            ]
+        )
 
     control_index: int | None = None
     for index, line in enumerate(normalized):
@@ -1759,9 +1775,41 @@ def _extract_kimi_sessions_menu(lines: list[str]) -> SelectionMenu | None:
 
     if not options:
         return None
+    if (
+        expected_count is not None
+        and len(options) < min(expected_count, 20)
+        and control_index is None
+    ):
+        return None
     if selected_index is None:
         selected_index = 0
     return SelectionMenu("请选择会话：", options=tuple(options[:20]), selected_index=selected_index)
+
+
+def _kimi_sessions_expected_count(lines: list[str]) -> int | None:
+    for line in lines:
+        match = re.search(r"(?i)\bSESSIONS\s*\(\s*\d+\s+of\s+(\d+)\s*\)", line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _has_kimi_sessions_context(lines: list[str], raw_text: str) -> bool:
+    normalized = [_normalize_menu_line(line) for line in lines]
+    visible = _visible_terminal_text(raw_text) if raw_text else ""
+    text = "\n".join(normalized)
+    combined = f"{text}\n{visible}"
+    return bool(
+        re.search(r"(?i)\bSESSIONS\s*\(\s*\d+\s+of\s+\d+\s*\)", combined)
+        or (
+            re.search(r"(?i)\bSessions\b", combined)
+            and re.search(
+                r"(?i)\bCtrl\+A\b.*\bshow all projects\b.*\bEnter to select\b.*\bEsc to cancel\b",
+                combined,
+                flags=re.DOTALL,
+            )
+        )
+    )
 
 
 def _is_kimi_session_meta_line(line: str) -> bool:
@@ -2942,6 +2990,7 @@ def _format_mobile_layout(text: str) -> str:
 
     result = "\n\n".join(block for block in blocks if block.strip())
     result = re.sub(r"(?m)(^- .*)\n\n(?=- )", r"\1\n", result)
+    result = re.sub(r"(?m)(^\d+[.)] .*)\n\n(?=\d+[.)] )", r"\1\n", result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result.strip()
 

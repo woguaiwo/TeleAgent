@@ -1202,6 +1202,16 @@ class TerminalCleanTest(unittest.TestCase):
         self.assertEqual(menu.options, ("Novel Team (31m ago · 073b7057)",))
         self.assertEqual(menu.selected_index, 0)
 
+    def test_extract_kimi_sessions_waits_for_expected_count_without_footer(self) -> None:
+        raw = (
+            "SESSIONS (1 of 4)  [current directory]\n"
+            "┌──────────────────────────────────|  Sessions  |───────────────────────────────────┐\n"
+            "│ ❯ WHAM                                                                            │\n"
+            "│   22m ago · c9caecf5                                                              │\n"
+        )
+
+        self.assertIsNone(_extract_selection_menu(raw))
+
     def test_extract_kimi_sessions_ignores_post_choice_redraw_noise(self) -> None:
         raw = (
             "┌────────────────────| Sessions |────────────────────┐\n"
@@ -2968,6 +2978,55 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("请选择会话", messages[0])
         self.assertIn("1. WHAM (22m ago · c9caecf5) *", messages[0])
         self.assertIn("2. hi (40m ago · 451c3264)", messages[0])
+        self.assertIn("3. 1 (44m ago · 4a4914b9)", messages[0])
+        self.assertIn("4. Hi (58m ago · f446825d)", messages[0])
+
+    def test_debug_bridge_waits_for_chunked_kimi_sessions_panel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                chunks = [
+                    "\x1b[?1049h\x1b[H"
+                    "\x1b[0;38;5;81;48;5;235;1m SESSIONS (1 of 4) \x1b[0m\r",
+                    "\x1b[0;38;5;24m┌────────────────|"
+                    "\x1b[0;38;5;81;48;5;234;1m Sessions "
+                    "\x1b[0;38;5;24m|────────────────┐\x1b[0m\r",
+                    "\x1b[3;1H│ \x1b[1m❯ WHAM\x1b[0m │\r"
+                    "\x1b[4;1H│   22m ago · c9caecf5 │\r",
+                    "\x1b[5;1H│   hi │\r"
+                    "\x1b[6;1H│   40m ago · 451c3264 │\r",
+                    "\x1b[7;1H│   1 │\r"
+                    "\x1b[8;1H│   44m ago · 4a4914b9 │\r",
+                    "\x1b[9;1H│   Hi │\r"
+                    "\x1b[10;1H│   58m ago · f446825d │\r",
+                ]
+                for index, chunk in enumerate(chunks):
+                    bridge.record_output(chunk)
+                    bridge.flush_idle_output()
+                    if index < len(chunks) - 1 and outbox.exists():
+                        self.assertEqual(outbox.read_text(encoding="utf-8"), "")
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(messages[0].startswith("请选择会话：\n回复数字选择"))
+        self.assertIn("1. WHAM (22m ago · c9caecf5) *\n2. hi", messages[0])
         self.assertIn("3. 1 (44m ago · 4a4914b9)", messages[0])
         self.assertIn("4. Hi (58m ago · f446825d)", messages[0])
 
