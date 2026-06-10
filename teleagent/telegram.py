@@ -882,6 +882,8 @@ class TelegramBridge:
         self._pending_menu: SelectionMenu | None = None
         self._sent_menu_fingerprint = ""
         self._suppress_menu_until = 0.0
+        self._restore_redraw_active = False
+        self._restore_redraw_ready_seen = False
         self._auto_continue_enabled = False
         self._auto_continue_until: float | None = None
         self._pending_auto_continue_prompt: str | None = None
@@ -980,6 +982,8 @@ class TelegramBridge:
         if not self.enabled:
             return
         _append_text(Path(self.config.raw_history_path), text)
+        if self._restore_redraw_active and _terminal_raw_has_ready_prompt(text):
+            self._restore_redraw_ready_seen = True
         if _terminal_raw_has_active_status(text):
             self._terminal_busy_until = time.monotonic() + max(
                 _AUTO_CONTINUE_BUSY_GRACE_SECONDS,
@@ -995,6 +999,7 @@ class TelegramBridge:
         if not self.enabled:
             return None
         self._refresh_auto_continue_state()
+        self._maybe_finish_restore_redraw_guard()
         auto_prompt = self._pop_auto_continue_prompt_if_ready()
         if auto_prompt:
             return auto_prompt
@@ -1003,6 +1008,8 @@ class TelegramBridge:
             structured_pending = self._poll_structured_output(source)
             structured_polled[source] = structured_pending
             if structured_pending:
+                if self._restore_redraw_active:
+                    return None
                 return self._deliver_output(structured_pending, source=source)
 
         if (
@@ -1044,6 +1051,8 @@ class TelegramBridge:
         raw_pending = _remove_recent_user_echoes(raw_pending, self._recent_user_inputs)
         if self._maybe_forward_selection_menu(raw_pending):
             return None
+        if self._consume_restore_redraw(raw_pending):
+            return None
 
         terminal_pending: str | None = None
         for source in self.config.output_sources:
@@ -1054,12 +1063,16 @@ class TelegramBridge:
                     structured_pending = self._poll_structured_output(source)
                     structured_polled[source] = structured_pending
                 if structured_pending:
+                    if self._restore_redraw_active:
+                        return None
                     return self._deliver_output(structured_pending, source=source)
                 continue
             if source == "terminal":
                 if terminal_pending is None:
                     terminal_pending = self._clean_terminal_pending(raw_pending)
                 if terminal_pending:
+                    if self._consume_restore_redraw(raw_pending):
+                        return None
                     return self._deliver_output(
                         terminal_pending,
                         source=source,
@@ -1096,6 +1109,31 @@ class TelegramBridge:
         pending = _clean_terminal_text(pending).strip()
         return pending
 
+    def _begin_restore_redraw_guard(self) -> None:
+        self._restore_redraw_active = True
+        self._restore_redraw_ready_seen = False
+        self._clear_pending_summary()
+        self._pending_auto_continue_prompt = None
+
+    def _end_restore_redraw_guard(self) -> None:
+        self._restore_redraw_active = False
+        self._restore_redraw_ready_seen = False
+
+    def _maybe_finish_restore_redraw_guard(self) -> None:
+        if (
+            self._restore_redraw_active
+            and self._restore_redraw_ready_seen
+            and not self._pending_raw_output
+        ):
+            self._end_restore_redraw_guard()
+
+    def _consume_restore_redraw(self, raw_pending: str) -> bool:
+        if not self._restore_redraw_active:
+            return False
+        if _terminal_raw_has_ready_prompt(raw_pending):
+            self._end_restore_redraw_guard()
+        return True
+
     def _after_model_output_delivered(self, *, allow_auto_continue: bool = True) -> str | None:
         self._schedule_auto_continue_prompt()
         if not allow_auto_continue:
@@ -1117,6 +1155,8 @@ class TelegramBridge:
 
     def _pop_auto_continue_prompt_if_ready(self) -> str | None:
         if not self._pending_auto_continue_prompt:
+            return None
+        if self._restore_redraw_active:
             return None
         if self._awaiting_summary or self._pending_raw_output:
             return None
@@ -1295,6 +1335,10 @@ class TelegramBridge:
         if text:
             self._clear_pending_summary()
             self._pending_auto_continue_prompt = None
+            if _is_restore_redraw_command(text):
+                self._begin_restore_redraw_guard()
+            else:
+                self._end_restore_redraw_guard()
             self._recent_user_inputs.append(text)
             self._recent_user_inputs = self._recent_user_inputs[-10:]
 
@@ -1313,11 +1357,14 @@ class TelegramBridge:
             )
             return TelegramInput(TelegramInputKind.IGNORE, stripped)
 
+        menu = self._pending_menu
         target_index = choice - 1
-        current_index = self._pending_menu.selected_index
+        current_index = menu.selected_index
         self._pending_menu = None
         self._sent_menu_fingerprint = ""
         self._suppress_menu_until = time.monotonic() + _MENU_CHOICE_SUPPRESS_SECONDS
+        if _is_restore_redraw_menu(menu):
+            self._begin_restore_redraw_guard()
         if target_index == current_index:
             return TelegramInput(TelegramInputKind.KEY, "enter")
         if target_index > current_index:
@@ -1520,6 +1567,8 @@ class TelegramBridge:
         menu = _extract_selection_menu(text)
         if menu is None:
             return False
+        if _is_restore_redraw_menu(menu):
+            self._begin_restore_redraw_guard()
         if time.monotonic() < self._suppress_menu_until:
             self._pending_menu = None
             return True
@@ -2509,6 +2558,43 @@ def _parse_teleagent_command(stripped: str) -> str | None:
         "help": "/help",
     }
     return aliases.get(command)
+
+
+def _is_restore_redraw_command(text: str) -> bool:
+    return bool(re.fullmatch(r"/(?:resume|sessions)(?:\s+.*)?", text.strip()))
+
+
+def _is_restore_redraw_menu(menu: SelectionMenu) -> bool:
+    return menu.title == "请选择会话："
+
+
+def _terminal_raw_has_ready_prompt(text: str) -> bool:
+    visible_stream = _visible_terminal_text(text)
+    snapshot = _terminal_snapshot_text(text)
+    combined = "\n".join(part for part in (visible_stream, snapshot) if part.strip())
+    combined = _strip_terminal_control_fragments(combined)
+    lowered = re.sub(r"\s+", " ", combined.lower())
+    if any(
+        marker in lowered
+        for marker in (
+            "tab to queue message",
+            "context left",
+            "shift-tab: plan mode",
+            "ctrl-o: editor",
+            "ctrl+o comfy",
+        )
+    ):
+        return True
+    return bool(
+        re.search(
+            r"(?mi)^\s*›\s*(?:"
+            r"use /skills|implement \{feature\}|find and fix a bug|"
+            r"write tests|improve documentation|summarize recent commits|"
+            r"review code|explain this codebase|generate a plan|fix this bug"
+            r")\b",
+            combined,
+        )
+    )
 
 
 def _append_text(path: Path, text: str) -> None:

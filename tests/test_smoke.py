@@ -3296,6 +3296,91 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         messages = [record["text"] for record in records if record["type"] == "message"]
         self.assertEqual(messages, [])
 
+    def test_resume_restore_redraw_does_not_trigger_auto_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            history = Path(tmp) / "history.log"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(history),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_timeout_seconds=999,
+                )
+            )
+            try:
+                bridge.mark_user_input("/resume")
+                bridge.record_output("旧会话恢复内容。" * 30)
+                first_prompt = bridge.flush_idle_output()
+                bridge.record_output(
+                    "\x1b[5;1H› Use /skills to list available skills"
+                    "\x1b[7;3Hgpt-5.5 xhigh · /data/lyxie/Motion-X"
+                )
+                second_prompt = bridge.flush_idle_output()
+                bridge.record_output("新模型回复内容。" * 30)
+                summary_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+            history_text = history.read_text(encoding="utf-8") if history.exists() else ""
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNone(second_prompt)
+        self.assertIsNotNone(summary_prompt)
+        assert summary_prompt is not None
+        self.assertIn("总结成", summary_prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("输出较长", messages[0])
+        self.assertNotIn("旧会话恢复内容", messages[0])
+        self.assertNotIn("旧会话恢复内容", history_text)
+        self.assertIn("新模型回复内容", history_text)
+
+    def test_session_menu_choice_restore_redraw_does_not_trigger_auto_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            history = Path(tmp) / "history.log"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(history),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_timeout_seconds=999,
+                )
+            )
+            try:
+                bridge._pending_menu = SelectionMenu(
+                    "请选择会话：",
+                    ("WHAM (22m ago · c9caecf5)", "hi (40m ago · 451c3264)"),
+                    0,
+                )
+                action = bridge.consume_menu_choice("1")
+                self.assertEqual(action, TelegramInput(TelegramInputKind.KEY, "enter"))
+                bridge.record_output("恢复出来的旧会话正文。" * 30)
+                prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+            history_text = history.read_text(encoding="utf-8") if history.exists() else ""
+
+        self.assertIsNone(prompt)
+        self.assertEqual([record["text"] for record in records if record["type"] == "message"], [])
+        self.assertEqual(history_text, "")
+
     def test_kimi_normal_reply_is_not_forwarded_as_terminal_menu(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = Path(tmp) / "outbox.jsonl"

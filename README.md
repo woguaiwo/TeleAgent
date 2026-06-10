@@ -286,6 +286,10 @@ TeleAgent now supports both full output and summary output:
   menu commands such as `/model`, `/resume`, and `/sessions`. The default waits
   briefly, then sends one Enter so the menu can open without immediately
   selecting its first item.
+- After `/resume`, `/sessions`, or choosing a session from a forwarded session
+  menu, TeleAgent suppresses restored terminal redraw/history replay until the
+  CLI returns to an input prompt. This prevents old session content from being
+  treated as a new long model reply and triggering an automatic summary prompt.
 - In auto mode, TeleAgent does not inject the continue prompt while terminal
   output is still pending or a background terminal status is active. The prompt
   is kept pending and submitted after the terminal has been quiet briefly.
