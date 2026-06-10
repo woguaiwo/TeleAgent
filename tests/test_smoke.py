@@ -976,6 +976,24 @@ class TelegramInputTest(unittest.TestCase):
         self.assertEqual(action.kind, TelegramInputKind.COMMAND)
         self.assertEqual(action.text, "/history")
 
+    def test_ta_auto_start_command(self) -> None:
+        action = parse_telegram_input("/ta auto start")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/auto start")
+
+    def test_ta_auto_hours_command(self) -> None:
+        action = parse_telegram_input("/ta auto 7.5")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/auto 7.5")
+
+    def test_ta_auto_end_command(self) -> None:
+        action = parse_telegram_input("/ta auto end")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/auto end")
+
     def test_model_slash_command_is_forwarded_to_cli(self) -> None:
         action = parse_telegram_input("/model gpt-5")
 
@@ -3522,6 +3540,166 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("这是很长的原始输出。", messages[2])
         self.assertIn("...[truncated]", messages[2])
 
+    def test_auto_continue_returns_prompt_after_short_model_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.handle_command("/auto start")
+                bridge.record_output("一句话结论：阶段完成。")
+                prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertEqual(prompt, "请继续推进,注意在合适的时候记录进展")
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertIn("已开启自动推进模式", messages[0])
+        self.assertIn("一句话结论：阶段完成。", messages[1])
+
+    def test_auto_continue_end_stops_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.handle_command("/auto start")
+                bridge.handle_command("/auto end")
+                bridge.record_output("一句话结论：阶段完成。")
+                prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertTrue(any("已关闭自动推进模式" in message for message in messages))
+        self.assertIn("一句话结论：阶段完成。", messages[-1])
+
+    def test_auto_continue_timer_expiry_stops_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.handle_command("/auto 7.5")
+                bridge._auto_continue_until = time.monotonic() - 1
+                bridge.record_output("一句话结论：阶段完成。")
+                prompt = bridge.flush_idle_output()
+                second_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(prompt)
+        self.assertIsNone(second_prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertTrue(any("自动推进模式已到期" in message for message in messages))
+        self.assertTrue(any("一句话结论：阶段完成。" in message for message in messages))
+
+    def test_auto_continue_waits_for_summary_before_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_timeout_seconds=999,
+                )
+            )
+            try:
+                bridge.handle_command("/auto start")
+                bridge.record_output("这是很长的输出。" * 20)
+                summary_prompt = bridge.flush_idle_output()
+                self.assertIsNotNone(summary_prompt)
+                assert summary_prompt is not None
+                self.assertIn("总结成", summary_prompt)
+                bridge.mark_injected_prompt(summary_prompt)
+                bridge.record_output(summary_prompt + "一句话结论：这是摘要。")
+                auto_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+        self.assertEqual(auto_prompt, "请继续推进,注意在合适的时候记录进展")
+
+    def test_auto_continue_does_not_prompt_while_background_terminal_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.handle_command("/auto start")
+                bridge.record_output(
+                    "一句话结论：当前 sweep 还在跑。"
+                    "\n• Working (1m 02s • esc to interrupt) · "
+                    "1 background terminal running · /ps to view · /stop to close"
+                )
+                prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertIn("一句话结论：当前 sweep 还在跑。", messages[-1])
+
     def test_long_terminal_output_with_active_background_does_not_request_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = Path(tmp) / "outbox.jsonl"
@@ -3541,6 +3719,7 @@ class TelegramDebugBridgeTest(unittest.TestCase):
                 )
             )
             try:
+                bridge.handle_command("/auto start")
                 bridge.record_output(
                     ("一句话结论：当前任务仍在跑，已经有阶段性结果。" * 12)
                     + "\n• Working (14m 29s • esc to interrupt) · "
@@ -3559,8 +3738,9 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             )
         )
         messages = [str(record["text"]) for record in records if record["type"] == "message"]
-        self.assertEqual(len(messages), 1)
-        self.assertIn("暂不自动插入摘要请求", messages[0])
+        self.assertEqual(len(messages), 2)
+        self.assertIn("已开启自动推进模式", messages[0])
+        self.assertIn("暂不自动插入摘要请求", messages[1])
 
     def test_long_output_without_auto_summary_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -40,6 +40,7 @@ _KIMI_SESSION_INITIAL_READ_LIMIT = 5_000_000
 _KIMI_SESSION_DISCOVERY_GRACE_SECONDS = 30.0
 _RECENT_OUTPUT_FINGERPRINT_TTL_SECONDS = 60.0
 _MENU_CHOICE_SUPPRESS_SECONDS = 2.0
+_AUTO_CONTINUE_PROMPT = "请继续推进,注意在合适的时候记录进展"
 
 
 class TelegramInputKind(Enum):
@@ -868,6 +869,9 @@ class TelegramBridge:
         self._pending_menu: SelectionMenu | None = None
         self._sent_menu_fingerprint = ""
         self._suppress_menu_until = 0.0
+        self._auto_continue_enabled = False
+        self._auto_continue_until: float | None = None
+        self._pending_auto_continue_prompt: str | None = None
         self._structured_sources: dict[str, object] = {}
         if "codex_rollout" in config.output_sources:
             self._structured_sources["codex_rollout"] = _CodexRolloutOutputSource(
@@ -951,6 +955,7 @@ class TelegramBridge:
                 continue
             _append_history_entry(Path(self.config.history_path), cleaned)
             self._send_to_allowed_chats(_truncate(cleaned, self.config.max_message_chars))
+            self._schedule_auto_continue_prompt()
             self._pending_raw_output = ""
             self._pending_output = ""
             self._last_output_at = None
@@ -970,6 +975,10 @@ class TelegramBridge:
     def flush_idle_output(self) -> str | None:
         if not self.enabled:
             return None
+        self._refresh_auto_continue_state()
+        auto_prompt = self._pop_auto_continue_prompt()
+        if auto_prompt:
+            return auto_prompt
         structured_polled: dict[str, str] = {}
         for source in self._structured_sources_before_terminal():
             structured_pending = self._poll_structured_output(source)
@@ -1067,6 +1076,39 @@ class TelegramBridge:
         pending = _clean_terminal_text(pending).strip()
         return pending
 
+    def _after_model_output_delivered(self, *, allow_auto_continue: bool = True) -> str | None:
+        if allow_auto_continue:
+            self._schedule_auto_continue_prompt()
+        return self._pop_auto_continue_prompt()
+
+    def _schedule_auto_continue_prompt(self) -> None:
+        if not self._auto_continue_is_active():
+            return
+        self._pending_auto_continue_prompt = _AUTO_CONTINUE_PROMPT
+
+    def _pop_auto_continue_prompt(self) -> str | None:
+        if not self._auto_continue_is_active():
+            self._pending_auto_continue_prompt = None
+            return None
+        prompt = self._pending_auto_continue_prompt
+        self._pending_auto_continue_prompt = None
+        return prompt
+
+    def _auto_continue_is_active(self) -> bool:
+        self._refresh_auto_continue_state()
+        return self._auto_continue_enabled
+
+    def _refresh_auto_continue_state(self) -> None:
+        if (
+            self._auto_continue_enabled
+            and self._auto_continue_until is not None
+            and time.monotonic() >= self._auto_continue_until
+        ):
+            self._auto_continue_enabled = False
+            self._auto_continue_until = None
+            self._pending_auto_continue_prompt = None
+            self._send_to_allowed_chats("自动推进模式已到期，已恢复等待用户回复。")
+
     def _deliver_output(
         self,
         pending: str,
@@ -1075,6 +1117,7 @@ class TelegramBridge:
         defer_auto_summary: bool = False,
     ) -> str | None:
         structured = source != "terminal"
+        allow_auto_continue = not (defer_auto_summary and not structured)
         pending = _clean_structured_text(pending) if structured else pending.strip()
         if not pending:
             return None
@@ -1090,7 +1133,9 @@ class TelegramBridge:
                 self.config.all_chunk_chars,
                 structured=structured,
             )
-            return None
+            return self._after_model_output_delivered(
+                allow_auto_continue=allow_auto_continue,
+            )
 
         if self._awaiting_summary:
             self._awaiting_summary = False
@@ -1098,11 +1143,15 @@ class TelegramBridge:
             self._summary_fallback_output = ""
             self._summary_fallback_structured = False
             self._send_to_allowed_chats(pending, structured=structured)
-            return None
+            return self._after_model_output_delivered(
+                allow_auto_continue=allow_auto_continue,
+            )
 
         if len(pending) <= self.config.summary_threshold_chars:
             self._send_to_allowed_chats(pending, structured=structured)
-            return None
+            return self._after_model_output_delivered(
+                allow_auto_continue=allow_auto_continue,
+            )
 
         if not self.config.auto_summary:
             max_chars = min(self.config.summary_fallback_chars, self.config.max_message_chars)
@@ -1111,7 +1160,9 @@ class TelegramBridge:
                 f"先发送原输出前 {max_chars} 字。发送 /history 可获取完整记录。"
             )
             self._send_output_preview(pending, max_chars, structured=structured)
-            return None
+            return self._after_model_output_delivered(
+                allow_auto_continue=allow_auto_continue,
+            )
         if defer_auto_summary and not structured:
             self._send_to_allowed_chats(
                 f"输出较长，已写入 {self.config.history_path}。检测到底层 CLI 仍有 "
@@ -1208,6 +1259,9 @@ class TelegramBridge:
         if not self.enabled:
             return
         normalized = command.strip()
+        if normalized.startswith("/auto"):
+            self._handle_auto_continue_command(normalized)
+            return
         if normalized == "/all":
             self._mode = "all"
             self._send_to_allowed_chats("已切换到完整输出模式。发送 /summary 可切回摘要模式。")
@@ -1225,9 +1279,64 @@ class TelegramBridge:
         if normalized == "/help":
             self._send_to_allowed_chats(
                 "TeleAgent 控制命令：/ta all、/ta summary、/ta history、"
-                "/ta rawhistory。其他 / 开头消息会发送给底层 CLI。"
+                "/ta rawhistory、/ta auto start、/ta auto end、/ta auto 7.5。"
+                "其他 / 开头消息会发送给底层 CLI。"
             )
             return
+
+    def _handle_auto_continue_command(self, command: str) -> None:
+        argument = command[len("/auto") :].strip().lower()
+        if argument in {"", "status"}:
+            self._refresh_auto_continue_state()
+            if not self._auto_continue_enabled:
+                self._send_to_allowed_chats(
+                    "自动推进模式未开启。发送 /ta auto start 开启，或 /ta auto 7.5 开启 7.5 小时。"
+                )
+                return
+            if self._auto_continue_until is None:
+                self._send_to_allowed_chats(
+                    f"自动推进模式已开启。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}"
+                )
+                return
+            remaining_hours = max(0.0, (self._auto_continue_until - time.monotonic()) / 3600)
+            self._send_to_allowed_chats(
+                "自动推进模式已开启，约 "
+                f"{remaining_hours:.2f} 小时后到期。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}"
+            )
+            return
+        if argument in {"start", "on"}:
+            self._auto_continue_enabled = True
+            self._auto_continue_until = None
+            self._pending_auto_continue_prompt = None
+            self._send_to_allowed_chats(
+                f"已开启自动推进模式。模型每次回复后会自动发送：{_AUTO_CONTINUE_PROMPT}。"
+                "发送 /ta auto end 可关闭。"
+            )
+            return
+        if argument in {"end", "stop", "off"}:
+            self._auto_continue_enabled = False
+            self._auto_continue_until = None
+            self._pending_auto_continue_prompt = None
+            self._send_to_allowed_chats("已关闭自动推进模式，恢复等待用户回复。")
+            return
+        try:
+            hours = float(argument)
+        except ValueError:
+            self._send_to_allowed_chats(
+                "无法识别自动推进命令。用法：/ta auto start、/ta auto end、/ta auto 7.5。"
+            )
+            return
+        if hours <= 0:
+            self._send_to_allowed_chats("自动推进倒计时必须大于 0 小时。")
+            return
+        self._auto_continue_enabled = True
+        self._auto_continue_until = time.monotonic() + hours * 3600
+        self._pending_auto_continue_prompt = None
+        self._send_to_allowed_chats(
+            f"已开启自动推进模式，将在 {hours:g} 小时后自动停止。"
+            f"模型每次回复后会自动发送：{_AUTO_CONTINUE_PROMPT}。"
+            "发送 /ta auto end 可提前关闭。"
+        )
 
     def send_history(self, *, raw: bool) -> None:
         if not self.enabled or self._client is None:
@@ -1327,6 +1436,7 @@ class TelegramBridge:
             f"完整记录可发送 /history 获取。"
         )
         self._send_output_preview(fallback, max_chars, structured=structured)
+        self._schedule_auto_continue_prompt()
 
     def _send_output_preview(self, text: str, max_chars: int, *, structured: bool = False) -> None:
         preview = text[:max_chars].rstrip()
@@ -2314,6 +2424,10 @@ def _parse_teleagent_command(stripped: str) -> str | None:
         return None
 
     command = stripped[len("/ta ") :].strip().lower()
+    if command == "auto":
+        return "/auto status"
+    if command.startswith("auto "):
+        return "/auto " + command[len("auto ") :].strip()
     aliases = {
         "all": "/all",
         "summary": "/summary",
