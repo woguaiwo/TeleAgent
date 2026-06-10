@@ -157,10 +157,6 @@ def run_wrapped(
             readable, _, _ = select.select(read_fds, [], [], 0.5)
             for error in telegram.pop_errors():
                 print(f"\r\n[teleagent] telegram error: {error}\r\n", file=sys.stderr)
-            summary_prompt = telegram.flush_idle_output()
-            if summary_prompt:
-                telegram.mark_injected_prompt(summary_prompt)
-                _submit_summary_prompt(master_fd, summary_prompt, config.telegram)
             if master_fd in readable:
                 try:
                     chunk = os.read(master_fd, 4096)
@@ -212,6 +208,16 @@ def run_wrapped(
                     if action.kind in (TelegramInputKind.SEND, TelegramInputKind.TYPE):
                         telegram.mark_user_input(action.text)
                     _write_telegram_input(master_fd, action, config.telegram)
+            injected_prompt = telegram.flush_idle_output()
+            if injected_prompt:
+                telegram.mark_injected_prompt(injected_prompt)
+                print(
+                    f"\r\n[teleagent] injected -> cli: {_describe_injected_prompt(injected_prompt)}\r\n",
+                    file=sys.stderr,
+                    end="",
+                    flush=True,
+                )
+                _submit_injected_prompt(master_fd, injected_prompt, config.telegram)
     finally:
         telegram.close()
         if old_stdin_attrs is not None:
@@ -403,7 +409,7 @@ def _write_telegram_input(
         _write_key_sequence_list(master_fd, _split_key_names(action.text))
 
 
-def _submit_summary_prompt(
+def _submit_injected_prompt(
     master_fd: int,
     prompt: str,
     telegram_config: TelegramConfig,
@@ -412,6 +418,13 @@ def _submit_summary_prompt(
     if telegram_config.summary_submit_delay_seconds:
         time.sleep(telegram_config.summary_submit_delay_seconds)
     _write_key_sequence_list(master_fd, telegram_config.summary_submit_keys)
+
+
+def _describe_injected_prompt(prompt: str) -> str:
+    compact = " ".join(prompt.split())
+    if len(compact) > 80:
+        compact = compact[:77].rstrip() + "..."
+    return compact
 
 
 def _submit_telegram_input(

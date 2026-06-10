@@ -40,7 +40,8 @@ _KIMI_SESSION_INITIAL_READ_LIMIT = 5_000_000
 _KIMI_SESSION_DISCOVERY_GRACE_SECONDS = 30.0
 _RECENT_OUTPUT_FINGERPRINT_TTL_SECONDS = 60.0
 _MENU_CHOICE_SUPPRESS_SECONDS = 2.0
-_AUTO_CONTINUE_PROMPT = "请继续推进,注意在合适的时候记录进展"
+_AUTO_CONTINUE_BUSY_GRACE_SECONDS = 5.0
+_AUTO_CONTINUE_PROMPT = "请继续推进，并且在合适的时候记录进展在 log 里"
 
 
 class TelegramInputKind(Enum):
@@ -884,6 +885,7 @@ class TelegramBridge:
         self._auto_continue_enabled = False
         self._auto_continue_until: float | None = None
         self._pending_auto_continue_prompt: str | None = None
+        self._terminal_busy_until = 0.0
         self._structured_sources: dict[str, object] = {}
         if "codex_rollout" in config.output_sources:
             self._structured_sources["codex_rollout"] = _CodexRolloutOutputSource(
@@ -978,6 +980,11 @@ class TelegramBridge:
         if not self.enabled:
             return
         _append_text(Path(self.config.raw_history_path), text)
+        if _terminal_raw_has_active_status(text):
+            self._terminal_busy_until = time.monotonic() + max(
+                _AUTO_CONTINUE_BUSY_GRACE_SECONDS,
+                self.config.idle_forward_seconds,
+            )
         if _terminal_chunk_has_pending_signal(text):
             self._pending_raw_output = (self._pending_raw_output + text)[
                 -_pending_raw_limit(self.config) :
@@ -988,7 +995,7 @@ class TelegramBridge:
         if not self.enabled:
             return None
         self._refresh_auto_continue_state()
-        auto_prompt = self._pop_auto_continue_prompt()
+        auto_prompt = self._pop_auto_continue_prompt_if_ready()
         if auto_prompt:
             return auto_prompt
         structured_polled: dict[str, str] = {}
@@ -1090,9 +1097,10 @@ class TelegramBridge:
         return pending
 
     def _after_model_output_delivered(self, *, allow_auto_continue: bool = True) -> str | None:
-        if allow_auto_continue:
-            self._schedule_auto_continue_prompt()
-        return self._pop_auto_continue_prompt()
+        self._schedule_auto_continue_prompt()
+        if not allow_auto_continue:
+            return None
+        return self._pop_auto_continue_prompt_if_ready()
 
     def _schedule_auto_continue_prompt(self) -> None:
         if not self._auto_continue_is_active():
@@ -1106,6 +1114,15 @@ class TelegramBridge:
         prompt = self._pending_auto_continue_prompt
         self._pending_auto_continue_prompt = None
         return prompt
+
+    def _pop_auto_continue_prompt_if_ready(self) -> str | None:
+        if not self._pending_auto_continue_prompt:
+            return None
+        if self._awaiting_summary or self._pending_raw_output:
+            return None
+        if time.monotonic() < self._terminal_busy_until:
+            return None
+        return self._pop_auto_continue_prompt()
 
     def _auto_continue_is_active(self) -> bool:
         self._refresh_auto_continue_state()
@@ -1197,7 +1214,7 @@ class TelegramBridge:
                 "background terminal 正在运行，暂不自动插入摘要请求，避免打断当前任务。"
                 "发送 /history 可获取完整记录；任务结束后可以直接让模型总结。"
             )
-            return None
+            return self._after_model_output_delivered(allow_auto_continue=False)
         self._send_to_allowed_chats(
             f"输出较长，已写入 {self.config.history_path}。正在请求模型生成 "
             f"{self.config.summary_max_chars} 字以内摘要。若摘要未返回，会自动发送截断预览。"
@@ -1277,6 +1294,7 @@ class TelegramBridge:
         text = text.strip()
         if text:
             self._clear_pending_summary()
+            self._pending_auto_continue_prompt = None
             self._recent_user_inputs.append(text)
             self._recent_user_inputs = self._recent_user_inputs[-10:]
 

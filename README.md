@@ -208,6 +208,9 @@ Telegram input controls:
 - `/ta summary`: switch Telegram back to summary mode
 - `/ta history`: send the full local output history file to Telegram
 - `/ta rawhistory`: send the raw PTY output file for debugging terminal rendering
+- `/ta auto start`: after each model reply, send `请继续推进，并且在合适的时候记录进展在 log 里`
+- `/ta auto 7.5`: enable auto mode for 7.5 hours; very small hour values are valid for testing
+- `/ta auto end`: stop auto mode and wait for user replies again
 - `/ta help`: show TeleAgent control commands
 - `/send hello`: type `hello` and press Enter
 - `/type hello`: type `hello` without pressing Enter
@@ -283,6 +286,9 @@ TeleAgent now supports both full output and summary output:
   menu commands such as `/model`, `/resume`, and `/sessions`. The default waits
   briefly, then sends one Enter so the menu can open without immediately
   selecting its first item.
+- In auto mode, TeleAgent does not inject the continue prompt while terminal
+  output is still pending or a background terminal status is active. The prompt
+  is kept pending and submitted after the terminal has been quiet briefly.
 - In `output_mode = "all"`, idle chunks are split into Telegram-sized messages.
 - Send `/ta history` in Telegram to receive the full history file.
 - Send `/ta all` or `/ta summary` to switch modes during a running session.
