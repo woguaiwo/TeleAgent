@@ -645,6 +645,42 @@ allowed_chat_ids = [123]
             self.assertEqual(copy_error, "")
             self.assertEqual(local_path.read_text(encoding="utf-8"), global_path.read_text(encoding="utf-8"))
 
+    def test_global_config_copy_uses_project_local_token_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            local_path = tmp_path / "project" / "teleagent.toml"
+            global_path = tmp_path / "global" / "teleagent.toml"
+            local_path.parent.mkdir()
+            global_path.parent.mkdir()
+            global_path.write_text(
+                f"""
+[settings]
+default_command = ["codex"]
+
+[telegram]
+enabled = true
+token_file = "{tmp_path}/global/telegram-token"
+allowed_chat_ids = [123]
+""",
+                encoding="utf-8",
+            )
+
+            resolved, initialized_from, copy_error = _resolve_config_path_with_status(
+                None,
+                local_path=local_path,
+                global_path=global_path,
+            )
+
+            self.assertEqual(resolved, local_path)
+            self.assertEqual(initialized_from, str(global_path))
+            self.assertEqual(copy_error, "")
+            self.assertTrue((local_path.parent / ".teleagent" / "telegram-token").exists())
+            config = WrapperConfig.load(local_path)
+            self.assertTrue(config.telegram.enabled)
+            self.assertEqual(config.telegram.allowed_chat_ids, (123,))
+            self.assertEqual(config.telegram.token_file, ".teleagent/telegram-token")
+            self.assertNotIn(str(tmp_path / "global" / "telegram-token"), local_path.read_text(encoding="utf-8"))
+
     def test_missing_local_and_global_config_uses_builtin_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -664,6 +700,7 @@ allowed_chat_ids = [123]
             self.assertEqual(copy_error, "")
             self.assertTrue(local_path.exists())
             self.assertTrue((local_path.parent / ".teleagent").is_dir())
+            self.assertTrue((local_path.parent / ".teleagent" / "telegram-token").exists())
             config = WrapperConfig.load(local_path)
             self.assertEqual(config.default_command, ("codex",))
             self.assertFalse(config.telegram.enabled)

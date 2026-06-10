@@ -81,8 +81,10 @@ initializes a project-local config:
 - if the global TeleAgent config exists, it copies that file
 - otherwise, it writes the built-in default template
 
-This lets each project start from your defaults while still allowing later
-per-project edits.
+During project initialization, `token_file` is set to
+`.teleagent/telegram-token` and that empty token file is created with `0600`
+permissions. This lets each project start from your defaults while still using
+its own Telegram bot token.
 
 `pip install` itself does not write to your home directory. Use `./install.sh`
 or `teleagent --init-global` when you want TeleAgent to create the global
@@ -345,6 +347,12 @@ that file is missing, it initializes one in the current directory: first from
 the global TeleAgent config if available, otherwise from the built-in default
 template. `TELEAGENT_CONFIG` can override this and disables the automatic
 project initialization.
+
+Project-local initialization rewrites `telegram.token_file` to
+`.teleagent/telegram-token` and creates that empty file. Keep the project token
+there when each project should use its own Telegram bot. To intentionally share
+one global token across projects, edit the generated project `teleagent.toml`
+and point `telegram.token_file` at the shared token file.
 
 Global config location:
 

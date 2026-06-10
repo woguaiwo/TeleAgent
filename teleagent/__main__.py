@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
-import shutil
 import sys
 import textwrap
 from pathlib import Path
@@ -13,6 +13,7 @@ from .wrapper import WrapperConfig, _config_for_command, run_wrapped
 
 
 LOCAL_CONFIG_PATH = Path("teleagent.toml")
+PROJECT_TOKEN_FILE = ".teleagent/telegram-token"
 TELEAGENT_HOME_ENV = "TELEAGENT_HOME"
 TELEAGENT_CONFIG_DIR_ENV = "TELEAGENT_CONFIG_DIR"
 DEFAULT_PROJECT_CONFIG = """
@@ -250,8 +251,7 @@ def _resolve_config_path_with_status(
     expanded_global = _expand_config_path(str(global_config))
     if expanded_global.exists():
         try:
-            local_config.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(expanded_global, local_config)
+            _write_project_config_from_global(expanded_global, local_config)
         except OSError as exc:
             return expanded_global, "", str(exc)
         return local_config, str(expanded_global), ""
@@ -265,8 +265,30 @@ def _resolve_config_path_with_status(
 
 def _write_default_project_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    (path.parent / ".teleagent").mkdir(exist_ok=True)
+    _ensure_private_file(path.parent / PROJECT_TOKEN_FILE)
     path.write_text(textwrap.dedent(DEFAULT_PROJECT_CONFIG).lstrip(), encoding="utf-8")
+
+
+def _write_project_config_from_global(global_path: Path, local_path: Path) -> None:
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    text = global_path.read_text(encoding="utf-8")
+    local_text, uses_project_token = _localize_project_token_file(text)
+    if uses_project_token:
+        _ensure_private_file(local_path.parent / PROJECT_TOKEN_FILE)
+    local_path.write_text(local_text, encoding="utf-8")
+
+
+def _localize_project_token_file(text: str) -> tuple[str, bool]:
+    token_line = re.compile(r"(?m)^(\s*token_file\s*=\s*).*$")
+    if not token_line.search(text):
+        return text, False
+
+    project_token = json.dumps(PROJECT_TOKEN_FILE)
+
+    def replace_token(match: re.Match[str]) -> str:
+        return f"{match.group(1)}{project_token}"
+
+    return token_line.sub(replace_token, text, count=1), True
 
 
 def _init_global_config(
