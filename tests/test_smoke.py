@@ -188,6 +188,8 @@ debug_mode = true
         self.assertIn("telegram.kimi_state_root: ~/.kimi", result.stdout)
         self.assertIn("telegram.summary_timeout_seconds: 30.0", result.stdout)
         self.assertIn("telegram.summary_fallback_chars: 3500", result.stdout)
+        self.assertIn("telegram.slash_submit_delay_seconds: 0.2", result.stdout)
+        self.assertIn("telegram.slash_submit_keys: ['enter']", result.stdout)
         self.assertIn("effective_command:", result.stdout)
 
     def test_doctor_reports_empty_token_file(self) -> None:
@@ -454,6 +456,8 @@ raw_history_path = "tmp-raw.log"
 output_mode = "all"
 input_submit_delay_seconds = 0.0
 input_submit_keys = ["enter", "linefeed"]
+slash_submit_delay_seconds = 0.15
+slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.1
 summary_submit_keys = ["linefeed"]
 """
@@ -475,6 +479,8 @@ summary_submit_keys = ["linefeed"]
         self.assertEqual(config.telegram.kimi_state_root, "~/.kimi")
         self.assertEqual(config.telegram.input_submit_delay_seconds, 0.0)
         self.assertEqual(config.telegram.input_submit_keys, ("enter", "linefeed"))
+        self.assertEqual(config.telegram.slash_submit_delay_seconds, 0.15)
+        self.assertEqual(config.telegram.slash_submit_keys, ("enter",))
         self.assertEqual(config.telegram.summary_submit_delay_seconds, 0.1)
         self.assertEqual(config.telegram.summary_submit_keys, ("linefeed",))
         self.assertEqual(config.telegram.summary_timeout_seconds, 30.0)
@@ -1953,6 +1959,7 @@ class TelegramWriteInputTest(unittest.TestCase):
             TelegramConfig(
                 input_submit_delay_seconds=0,
                 input_submit_keys=("enter", "linefeed"),
+                slash_submit_delay_seconds=0,
             ),
         )
 
@@ -1964,6 +1971,7 @@ class TelegramWriteInputTest(unittest.TestCase):
             TelegramConfig(
                 input_submit_delay_seconds=0,
                 input_submit_keys=("enter", "linefeed"),
+                slash_submit_delay_seconds=0,
             ),
         )
 
@@ -1975,10 +1983,24 @@ class TelegramWriteInputTest(unittest.TestCase):
             TelegramConfig(
                 input_submit_delay_seconds=0,
                 input_submit_keys=("enter", "linefeed"),
+                slash_submit_delay_seconds=0,
             ),
         )
 
         self.assertEqual(payload, b"/sessions\r")
+
+    def test_slash_command_uses_configured_slash_submit_keys(self) -> None:
+        payload = _capture_written_telegram_input(
+            TelegramInput(TelegramInputKind.SEND, "/resume"),
+            TelegramConfig(
+                input_submit_delay_seconds=0,
+                input_submit_keys=("enter", "linefeed"),
+                slash_submit_delay_seconds=0,
+                slash_submit_keys=("linefeed",),
+            ),
+        )
+
+        self.assertEqual(payload, b"/resume\n")
 
     def test_enter_uses_configured_submit_keys(self) -> None:
         payload = _capture_written_telegram_input(

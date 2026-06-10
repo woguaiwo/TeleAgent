@@ -378,10 +378,12 @@ def _write_telegram_input(
     if action.kind == TelegramInputKind.SEND:
         os.write(master_fd, action.text.encode())
         submit_keys = _submit_keys_for_send(action.text, telegram_config)
+        submit_delay = _submit_delay_for_send(action.text, telegram_config)
         _submit_telegram_input(
             master_fd,
             telegram_config,
             submit_keys=submit_keys,
+            delay_seconds=submit_delay,
             after_text=True,
         )
         return
@@ -393,6 +395,7 @@ def _write_telegram_input(
             master_fd,
             telegram_config,
             submit_keys=telegram_config.input_submit_keys,
+            delay_seconds=telegram_config.input_submit_delay_seconds,
             after_text=False,
         )
         return
@@ -416,18 +419,26 @@ def _submit_telegram_input(
     telegram_config: TelegramConfig,
     *,
     submit_keys: tuple[str, ...],
+    delay_seconds: float,
     after_text: bool,
 ) -> None:
-    if after_text and telegram_config.input_submit_delay_seconds:
-        time.sleep(telegram_config.input_submit_delay_seconds)
+    if after_text and delay_seconds:
+        time.sleep(delay_seconds)
     _write_key_sequence_list(master_fd, submit_keys)
 
 
 def _submit_keys_for_send(text: str, telegram_config: TelegramConfig) -> tuple[str, ...]:
     stripped = text.strip()
     if _is_interactive_slash_command(stripped):
-        return ("enter",)
+        return telegram_config.slash_submit_keys
     return telegram_config.input_submit_keys
+
+
+def _submit_delay_for_send(text: str, telegram_config: TelegramConfig) -> float:
+    stripped = text.strip()
+    if _is_interactive_slash_command(stripped):
+        return telegram_config.slash_submit_delay_seconds
+    return telegram_config.input_submit_delay_seconds
 
 
 def _is_interactive_slash_command(text: str) -> bool:

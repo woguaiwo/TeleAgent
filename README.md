@@ -182,6 +182,8 @@ summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
+slash_submit_delay_seconds = 0.2
+slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.2
 summary_submit_keys = ["enter", "linefeed"]
 summary_prompt_template = "请把你刚才过长的回复总结成 {max_chars} 字以内。面向手机聊天阅读：先给一句话结论，再用短条目列关键点；不要复述完整原文。"
@@ -277,6 +279,10 @@ TeleAgent now supports both full output and summary output:
   submitted. The default also sends Enter and then linefeed; if your CLI submits
   twice, set it to `["enter"]`, and if it only inserts a newline, try
   `["linefeed"]` or `["ctrl-j"]`.
+- `slash_submit_keys` and `slash_submit_delay_seconds` control forwarded slash
+  menu commands such as `/model`, `/resume`, and `/sessions`. The default waits
+  briefly, then sends one Enter so the menu can open without immediately
+  selecting its first item.
 - In `output_mode = "all"`, idle chunks are split into Telegram-sized messages.
 - Send `/ta history` in Telegram to receive the full history file.
 - Send `/ta all` or `/ta summary` to switch modes during a running session.

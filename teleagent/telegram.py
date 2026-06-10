@@ -98,6 +98,8 @@ class TelegramConfig:
     summary_fallback_chars: int = 3500
     input_submit_delay_seconds: float = 0.05
     input_submit_keys: tuple[str, ...] = ("enter", "linefeed")
+    slash_submit_delay_seconds: float = 0.2
+    slash_submit_keys: tuple[str, ...] = ("enter",)
     summary_submit_delay_seconds: float = 0.2
     summary_submit_keys: tuple[str, ...] = ("enter", "linefeed")
     summary_prompt_template: str = (
@@ -170,6 +172,8 @@ class TelegramConfig:
         summary_fallback_chars = data.get("summary_fallback_chars", 3500)
         input_submit_delay_seconds = data.get("input_submit_delay_seconds", 0.05)
         input_submit_keys = data.get("input_submit_keys", ["enter", "linefeed"])
+        slash_submit_delay_seconds = data.get("slash_submit_delay_seconds", 0.2)
+        slash_submit_keys = data.get("slash_submit_keys", ["enter"])
         summary_submit_delay_seconds = data.get("summary_submit_delay_seconds", 0.2)
         summary_submit_keys = data.get("summary_submit_keys", ["enter", "linefeed"])
         summary_prompt_template = data.get(
@@ -221,6 +225,12 @@ class TelegramConfig:
             isinstance(item, str) for item in input_submit_keys
         ):
             raise ValueError("telegram.input_submit_keys must be a list of strings")
+        if not isinstance(slash_submit_delay_seconds, int | float) or slash_submit_delay_seconds < 0:
+            raise ValueError("telegram.slash_submit_delay_seconds must be a number >= 0")
+        if not isinstance(slash_submit_keys, list) or not all(
+            isinstance(item, str) for item in slash_submit_keys
+        ):
+            raise ValueError("telegram.slash_submit_keys must be a list of strings")
         if not isinstance(summary_submit_delay_seconds, int | float) or summary_submit_delay_seconds < 0:
             raise ValueError("telegram.summary_submit_delay_seconds must be a number >= 0")
         if not isinstance(summary_submit_keys, list) or not all(
@@ -263,6 +273,8 @@ class TelegramConfig:
             summary_fallback_chars=summary_fallback_chars,
             input_submit_delay_seconds=float(input_submit_delay_seconds),
             input_submit_keys=tuple(input_submit_keys),
+            slash_submit_delay_seconds=float(slash_submit_delay_seconds),
+            slash_submit_keys=tuple(slash_submit_keys),
             summary_submit_delay_seconds=float(summary_submit_delay_seconds),
             summary_submit_keys=tuple(summary_submit_keys),
             summary_prompt_template=summary_prompt_template,

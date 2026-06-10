@@ -52,6 +52,8 @@ summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
+slash_submit_delay_seconds = 0.2
+slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.2
 summary_submit_keys = ["enter", "linefeed"]
 summary_prompt_template = "请把你刚才过长的回复总结成 {max_chars} 字以内。面向手机聊天阅读：先给一句话结论，再用短条目列关键点；不要复述完整原文。"
@@ -520,6 +522,10 @@ def _print_doctor(config_path: Path, config: WrapperConfig, command: list[str]) 
     print(f"telegram.summary_max_chars: {telegram.summary_max_chars}")
     print(f"telegram.summary_timeout_seconds: {telegram.summary_timeout_seconds}")
     print(f"telegram.summary_fallback_chars: {telegram.summary_fallback_chars}")
+    print(f"telegram.input_submit_delay_seconds: {telegram.input_submit_delay_seconds}")
+    print(f"telegram.input_submit_keys: {list(telegram.input_submit_keys)!r}")
+    print(f"telegram.slash_submit_delay_seconds: {telegram.slash_submit_delay_seconds}")
+    print(f"telegram.slash_submit_keys: {list(telegram.slash_submit_keys)!r}")
 
 
 if __name__ == "__main__":
