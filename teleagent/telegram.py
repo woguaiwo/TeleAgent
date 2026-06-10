@@ -1057,6 +1057,7 @@ class TelegramBridge:
                         terminal_pending,
                         source=source,
                         defer_auto_summary=_terminal_raw_has_active_status(raw_pending),
+                        raw_pending=raw_pending,
                     )
         return None
 
@@ -1127,19 +1128,19 @@ class TelegramBridge:
         *,
         source: str,
         defer_auto_summary: bool = False,
+        raw_pending: str = "",
     ) -> str | None:
         structured = source != "terminal"
         allow_auto_continue = not (defer_auto_summary and not structured)
         pending = _clean_structured_text(pending) if structured else pending.strip()
         if not pending:
             return None
-        if self._is_cross_source_duplicate(pending, source):
-            return None
-
-        self._remember_output_source(pending, source)
-        _append_history_entry(Path(self.config.history_path), pending)
 
         if self._mode == "all":
+            if self._is_cross_source_duplicate(pending, source):
+                return None
+            self._remember_output_source(pending, source)
+            _append_history_entry(Path(self.config.history_path), pending)
             self._send_long_message(
                 pending,
                 self.config.all_chunk_chars,
@@ -1150,14 +1151,29 @@ class TelegramBridge:
             )
 
         if self._awaiting_summary:
-            self._awaiting_summary = False
-            self._summary_requested_at = None
-            self._summary_fallback_output = ""
-            self._summary_fallback_structured = False
-            self._send_to_allowed_chats(pending, structured=structured)
+            summary = self._extract_summary_reply(
+                pending,
+                raw_pending=raw_pending,
+                structured=structured,
+            )
+            if not summary:
+                return None
+            if self._is_cross_source_duplicate(summary, source):
+                self._clear_pending_summary()
+                return None
+            self._remember_output_source(summary, source)
+            _append_history_entry(Path(self.config.history_path), summary)
+            self._clear_pending_summary()
+            self._send_to_allowed_chats(summary, structured=structured)
             return self._after_model_output_delivered(
                 allow_auto_continue=allow_auto_continue,
             )
+
+        if self._is_cross_source_duplicate(pending, source):
+            return None
+
+        self._remember_output_source(pending, source)
+        _append_history_entry(Path(self.config.history_path), pending)
 
         if len(pending) <= self.config.summary_threshold_chars:
             self._send_to_allowed_chats(pending, structured=structured)
@@ -1194,6 +1210,31 @@ class TelegramBridge:
         return self.config.summary_prompt_template.format(
             max_chars=self.config.summary_max_chars
         )
+
+    def _clear_pending_summary(self) -> None:
+        self._awaiting_summary = False
+        self._summary_requested_at = None
+        self._summary_fallback_output = ""
+        self._summary_fallback_structured = False
+
+    def _extract_summary_reply(
+        self,
+        text: str,
+        *,
+        raw_pending: str = "",
+        structured: bool = False,
+    ) -> str:
+        if raw_pending and not structured:
+            raw_summary = _extract_summary_reply_from_terminal_raw(raw_pending)
+            if raw_summary:
+                cleaned_raw = _extract_summary_reply_section(_clean_terminal_text(raw_summary))
+                if _looks_like_summary_reply(cleaned_raw):
+                    return cleaned_raw
+        cleaned = _clean_structured_text(text) if structured else _clean_terminal_text(text)
+        cleaned = _extract_summary_reply_section(cleaned)
+        if not _looks_like_summary_reply(cleaned):
+            return ""
+        return cleaned
 
     def _is_cross_source_duplicate(self, text: str, source: str) -> bool:
         fingerprint = _fingerprint_text(text)
@@ -1235,6 +1276,7 @@ class TelegramBridge:
     def mark_user_input(self, text: str) -> None:
         text = text.strip()
         if text:
+            self._clear_pending_summary()
             self._recent_user_inputs.append(text)
             self._recent_user_inputs = self._recent_user_inputs[-10:]
 
@@ -3162,6 +3204,110 @@ def _format_structured_for_mobile(text: str) -> str:
     if not text:
         return ""
     return _format_mobile_layout(text)
+
+
+def _looks_like_summary_reply(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return bool(re.match(_summary_reply_marker_pattern(), stripped))
+
+
+def _extract_summary_reply_section(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+
+    marker = re.search(_summary_reply_marker_pattern(), text)
+    if marker is None:
+        return ""
+    text = text[marker.start() :].strip()
+
+    second_marker = re.search(r"(?s).+?(?=\s+" + _summary_reply_marker_pattern() + r")", text)
+    if second_marker is not None:
+        text = second_marker.group(0).strip()
+
+    kept: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if kept:
+                kept.append("")
+            continue
+        if kept and (
+            _looks_like_summary_reply(stripped)
+            or _is_summary_reply_boundary_line(stripped)
+        ):
+            break
+        kept.append(line)
+
+    return "\n".join(kept).strip()
+
+
+def _extract_summary_reply_from_terminal_raw(text: str) -> str:
+    visible = _visible_terminal_text(text)
+    lines = visible.splitlines()
+    collected: list[str] = []
+    collecting = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if collecting and collected:
+                collected.append("")
+            continue
+
+        bullet = re.match(r"^[•●]\s*(?P<body>.+)$", stripped)
+        body = bullet.group("body").strip() if bullet else stripped
+
+        if not collecting:
+            marker = re.search(_summary_reply_marker_pattern(), body)
+            if marker is None:
+                continue
+            collected.append(body[marker.start() :].strip())
+            collecting = True
+            continue
+
+        if bullet or stripped.startswith("›"):
+            break
+        if _is_summary_reply_boundary_line(stripped):
+            break
+        collected.append(stripped)
+
+    return "\n".join(collected).strip()
+
+
+def _summary_reply_marker_pattern() -> str:
+    return r"(?:一句话(?:结论|总结)?|简要(?:结论|总结)|总结|结论)[：:]"
+
+
+def _is_summary_reply_boundary_line(stripped: str) -> bool:
+    if _is_terminal_ui_line(stripped):
+        return True
+    if _is_terminal_ui_block_header(stripped):
+        return True
+    lowered = stripped.lower()
+    if any(
+        token in lowered
+        for token in (
+            "background terminal",
+            "/ps to view",
+            "/stop to close",
+            "esc to interrupt",
+            "waiting for background terminal",
+            "aiting for background terminal",
+        )
+    ):
+        return True
+    if re.match(r"^\d+\s+\d{2}:\d{2}\s+\d+(?:\.\d+)?\s+\d+(?:\.\d+)?\b", stripped):
+        return True
+    if re.match(r"^(?:bwrap|python(?:\d+(?:\.\d+)?)?)\s+", stripped):
+        return True
+    if re.match(r"^(?:outputs/|/data/|/tmp/|[\w.-]+\.(?:csv|json|log))\b", stripped):
+        return True
+    if stripped.count(",") >= 6 and re.search(r"\d", stripped):
+        return True
+    return False
 
 
 def _format_mobile_layout(text: str) -> str:

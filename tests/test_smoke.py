@@ -3562,6 +3562,99 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("这是很长的原始输出。", messages[2])
         self.assertIn("...[truncated]", messages[2])
 
+    def test_user_input_cancels_pending_auto_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_timeout_seconds=999,
+                )
+            )
+            try:
+                bridge.record_output("这是很长的输出。" * 20)
+                prompt = bridge.flush_idle_output()
+                self.assertIsNotNone(prompt)
+                bridge.mark_injected_prompt(prompt or "")
+
+                bridge.mark_user_input("简单说说")
+                bridge.record_output(
+                    "收到。先简单说当前状态：sweep 还在跑，等结果出来再判断。"
+                )
+                bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("输出较长", messages[0])
+        self.assertEqual(
+            messages[1],
+            "收到。先简单说当前状态：sweep 还在跑，等结果出来再判断。",
+        )
+
+    def test_summary_reply_excludes_followup_tool_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            history = Path(tmp) / "history.log"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(history),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_timeout_seconds=999,
+                )
+            )
+            try:
+                bridge.record_output("这是很长的输出。" * 20)
+                prompt = bridge.flush_idle_output()
+                self.assertIsNotNone(prompt)
+                bridge.mark_injected_prompt(prompt or "")
+
+                bridge.record_output(
+                    f"› {prompt}\n"
+                    "• 一句话结论：我们已经从调坐标轴进入优化 acc 物理生成。\n"
+                    "  - 当前 sweep 还在跑。\n"
+                    "  - 等结果出来再判断哪类改法有效。\n"
+                    "• 刚才的长任务会话已经结束或被系统回收了，我现在检查输出文件。\n"
+                    "    1       00:00  0.0  0.0 bwrap --new-session\n"
+                    "    official_acc_modeling_sweep_near_wrist.csv\n"
+                    "    1 runing · /ps to view · /stop to close\n"
+                )
+                bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+            history_text = history.read_text(encoding="utf-8")
+
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("输出较长", messages[0])
+        self.assertIn("一句话结论：我们已经从调坐标轴进入优化 acc 物理生成。", messages[1])
+        self.assertIn("- 当前 sweep 还在跑。", messages[1])
+        self.assertNotIn("刚才的长任务会话", messages[1])
+        self.assertNotIn("/ps to view", messages[1])
+        self.assertNotIn("official_acc_modeling", messages[1])
+        self.assertNotIn("刚才的长任务会话", history_text)
+        self.assertNotIn("/ps to view", history_text)
+
     def test_auto_continue_returns_prompt_after_short_model_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = Path(tmp) / "outbox.jsonl"
