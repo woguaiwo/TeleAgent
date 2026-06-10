@@ -45,42 +45,72 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class SmokeTest(unittest.TestCase):
     def test_fake_cli_auto_reply(self) -> None:
-        env = os.environ.copy()
-        env["TELEGRAM_BOT_TOKEN"] = "fake-token"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "teleagent",
-                "-c",
-                str(ROOT / "examples" / "teleagent.toml"),
-                "--",
-                sys.executable,
-                str(ROOT / "examples" / "fake_cli.py"),
-            ],
-            cwd=ROOT,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            env=env,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            event_log = Path(tmp) / "events.log"
+            config_path = Path(tmp) / "teleagent.toml"
+            config_path.write_text(
+                f"""
+[settings]
+buffer_size = 8192
+log_matches = true
+event_log_path = "{event_log}"
+default_command = []
+
+[telegram]
+enabled = false
+
+[[rules]]
+name = "generic-yes-no-continue"
+pattern = "(continue|proceed)\\\\?\\\\s*\\\\[y/N\\\\]"
+reply = "y"
+
+[[rules]]
+name = "generic-numbered-choice-first"
+pattern = "enter choice\\\\s*:"
+reply = "1"
+""",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["TELEGRAM_BOT_TOKEN"] = "fake-token"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "-c",
+                    str(config_path),
+                    "--",
+                    sys.executable,
+                    str(ROOT / "examples" / "fake_cli.py"),
+                ],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+                env=env,
+            )
+            event_log_text = event_log.read_text(encoding="utf-8")
 
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("first=y", result.stdout)
         self.assertIn("second=1", result.stdout)
-        self.assertIn("matched 'generic-yes-no-continue'", result.stdout)
+        self.assertNotIn("[teleagent]", result.stdout)
+        self.assertIn("matched 'generic-yes-no-continue'", event_log_text)
 
     def test_debug_auto_continue_reaches_wrapped_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             inbox = tmp_path / "inbox.txt"
             outbox = tmp_path / "outbox.jsonl"
+            event_log = tmp_path / "events.log"
             config_path = tmp_path / "teleagent.toml"
             config_path.write_text(
                 f"""
 [settings]
 default_command = []
+event_log_path = "{event_log}"
 
 [telegram]
 enabled = true
@@ -132,9 +162,13 @@ summary_submit_keys = ["enter"]
                 self.fail(output)
 
             records = _read_debug_records(outbox)
+            event_log_text = event_log.read_text(encoding="utf-8")
 
         self.assertEqual(process.returncode, 0, output)
         self.assertIn("auto=请继续推进，并且在合适的时候记录进展在 log 里", output)
+        self.assertNotIn("[teleagent]", output)
+        self.assertIn("telegram -> cli: command '/auto start'", event_log_text)
+        self.assertIn("injected -> cli: 请继续推进", event_log_text)
         self.assertTrue(
             any(
                 "一句话结论：阶段完成。" in str(record.get("text", ""))
@@ -273,6 +307,7 @@ debug_mode = true
                 """
 [settings]
 default_command = ["codex"]
+event_log_path = "custom-events.log"
 
 [telegram]
 enabled = true
@@ -517,6 +552,7 @@ class ConfigTest(unittest.TestCase):
                 """
 [settings]
 default_command = ["codex"]
+event_log_path = "custom-events.log"
 
 [telegram]
 enabled = true
@@ -540,6 +576,7 @@ summary_submit_keys = ["linefeed"]
 
         self.assertTrue(config.telegram.enabled)
         self.assertEqual(config.default_command, ("codex",))
+        self.assertEqual(config.event_log_path, "custom-events.log")
         self.assertEqual(config.telegram.resolved_token(), "fake-token")
         self.assertEqual(config.telegram.allowed_chat_ids, (123,))
         self.assertEqual(len(config.telegram.forward_patterns), 1)

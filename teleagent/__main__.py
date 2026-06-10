@@ -20,6 +20,7 @@ DEFAULT_PROJECT_CONFIG = """
 [settings]
 buffer_size = 8192
 log_matches = true
+event_log_path = "teleagent-events.log"
 default_command = ["codex"]
 
 [telegram]

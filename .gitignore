@@ -20,6 +20,7 @@ env/
 /teleagent.toml
 teleagent-history.log
 teleagent-raw.log
+teleagent-events.log
 teleagent-debug-inbox.txt
 teleagent-debug-outbox.jsonl
 teleagent-debug-runs/

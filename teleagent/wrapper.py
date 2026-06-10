@@ -58,6 +58,7 @@ class WrapperConfig:
     rules: tuple[Rule, ...]
     buffer_size: int = 8192
     log_matches: bool = True
+    event_log_path: str = "teleagent-events.log"
     default_command: tuple[str, ...] = ()
     telegram: TelegramConfig = TelegramConfig()
 
@@ -86,11 +87,14 @@ class WrapperConfig:
 
         buffer_size = settings.get("buffer_size", 8192)
         log_matches = settings.get("log_matches", True)
+        event_log_path = settings.get("event_log_path", "teleagent-events.log")
         default_command_raw = settings.get("default_command", [])
         if not isinstance(buffer_size, int) or buffer_size < 256:
             raise ValueError("settings.buffer_size must be an integer >= 256")
         if not isinstance(log_matches, bool):
             raise ValueError("settings.log_matches must be a boolean")
+        if not isinstance(event_log_path, str):
+            raise ValueError("settings.event_log_path must be a string")
         if not isinstance(default_command_raw, list) or not all(
             isinstance(item, str) and item for item in default_command_raw
         ):
@@ -104,6 +108,7 @@ class WrapperConfig:
             rules=tuple(rules),
             buffer_size=buffer_size,
             log_matches=log_matches,
+            event_log_path=event_log_path,
             default_command=tuple(default_command_raw),
             telegram=TelegramConfig.from_dict(telegram_raw),
         )
@@ -139,12 +144,9 @@ def run_wrapped(
     telegram.start()
     if telegram.enabled:
         mode = "debug" if config.telegram.debug_mode else "telegram"
-        print(
-            f"\r\n[teleagent] {mode} bridge enabled; "
-            f"allowed_chat_ids={list(config.telegram.allowed_chat_ids)!r}\r\n",
-            file=sys.stderr,
-            end="",
-            flush=True,
+        _log_event(
+            config,
+            f"{mode} bridge enabled; allowed_chat_ids={list(config.telegram.allowed_chat_ids)!r}",
         )
 
     try:
@@ -156,7 +158,7 @@ def run_wrapped(
                 read_fds.append(telegram.read_fd)
             readable, _, _ = select.select(read_fds, [], [], 0.5)
             for error in telegram.pop_errors():
-                print(f"\r\n[teleagent] telegram error: {error}\r\n", file=sys.stderr)
+                _log_event(config, f"telegram error: {error}")
             if master_fd in readable:
                 try:
                     chunk = os.read(master_fd, 4096)
@@ -196,12 +198,7 @@ def run_wrapped(
                         menu_action = telegram.consume_menu_choice(action.text)
                         if menu_action is not None:
                             action = menu_action
-                    print(
-                        f"\r\n[teleagent] telegram -> cli: {_describe_telegram_input(action)}\r\n",
-                        file=sys.stderr,
-                        end="",
-                        flush=True,
-                    )
+                    _log_event(config, f"telegram -> cli: {_describe_telegram_input(action)}")
                     if action.kind == TelegramInputKind.COMMAND:
                         telegram.handle_command(action.text)
                         continue
@@ -211,12 +208,7 @@ def run_wrapped(
             injected_prompt = telegram.flush_idle_output()
             if injected_prompt:
                 telegram.mark_injected_prompt(injected_prompt)
-                print(
-                    f"\r\n[teleagent] injected -> cli: {_describe_injected_prompt(injected_prompt)}\r\n",
-                    file=sys.stderr,
-                    end="",
-                    flush=True,
-                )
+                _log_event(config, f"injected -> cli: {_describe_injected_prompt(injected_prompt)}")
                 _submit_injected_prompt(master_fd, injected_prompt, config.telegram)
     finally:
         telegram.close()
@@ -342,11 +334,9 @@ def _maybe_reply(
 
         if config.log_matches:
             status = "dry-run matched" if dry_run else "matched"
-            print(
-                f"\r\n[teleagent] {status} {rule.name!r}; reply={rule.reply!r}\r\n",
-                file=sys.stderr,
-                end="",
-                flush=True,
+            _log_event(
+                config,
+                f"{status} {rule.name!r}; reply={rule.reply!r}",
             )
 
         if not dry_run:
@@ -355,6 +345,19 @@ def _maybe_reply(
             used_once.add(rule.name)
         return True
     return False
+
+
+def _log_event(config: WrapperConfig, message: str) -> None:
+    if not config.event_log_path:
+        return
+    path = Path(config.event_log_path).expanduser()
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8", errors="replace") as handle:
+            handle.write(f"{timestamp} [teleagent] {message}\n")
+    except OSError:
+        return
 
 
 def _resize_pty(master_fd: int) -> None:

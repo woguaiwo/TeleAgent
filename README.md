@@ -94,6 +94,9 @@ Set `settings.default_command` in `teleagent.toml` to run `teleagent` directly:
 
 ```toml
 [settings]
+buffer_size = 8192
+log_matches = true
+event_log_path = "teleagent-events.log"
 default_command = ["codex"]
 ```
 
@@ -353,6 +356,7 @@ Settings:
 [settings]
 buffer_size = 8192
 log_matches = true
+event_log_path = "teleagent-events.log"
 default_command = ["codex"]
 ```
 
