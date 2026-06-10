@@ -1032,7 +1032,11 @@ class TelegramBridge:
                 if terminal_pending is None:
                     terminal_pending = self._clean_terminal_pending(raw_pending)
                 if terminal_pending:
-                    return self._deliver_output(terminal_pending, source=source)
+                    return self._deliver_output(
+                        terminal_pending,
+                        source=source,
+                        defer_auto_summary=_terminal_raw_has_active_status(raw_pending),
+                    )
         return None
 
     def _structured_sources_before_terminal(self) -> list[str]:
@@ -1063,7 +1067,13 @@ class TelegramBridge:
         pending = _clean_terminal_text(pending).strip()
         return pending
 
-    def _deliver_output(self, pending: str, *, source: str) -> str | None:
+    def _deliver_output(
+        self,
+        pending: str,
+        *,
+        source: str,
+        defer_auto_summary: bool = False,
+    ) -> str | None:
         structured = source != "terminal"
         pending = _clean_structured_text(pending) if structured else pending.strip()
         if not pending:
@@ -1101,6 +1111,13 @@ class TelegramBridge:
                 f"先发送原输出前 {max_chars} 字。发送 /history 可获取完整记录。"
             )
             self._send_output_preview(pending, max_chars, structured=structured)
+            return None
+        if defer_auto_summary and not structured:
+            self._send_to_allowed_chats(
+                f"输出较长，已写入 {self.config.history_path}。检测到底层 CLI 仍有 "
+                "background terminal 正在运行，暂不自动插入摘要请求，避免打断当前任务。"
+                "发送 /history 可获取完整记录；任务结束后可以直接让模型总结。"
+            )
             return None
         self._send_to_allowed_chats(
             f"输出较长，已写入 {self.config.history_path}。正在请求模型生成 "
@@ -1219,12 +1236,22 @@ class TelegramBridge:
         if not path.exists():
             self._send_to_allowed_chats("还没有历史记录文件。")
             return
-        send_path = path if raw else _write_clean_history_copy(path)
+        try:
+            send_path = path if raw else _write_clean_history_copy(path)
+            size_text = _format_bytes(send_path.stat().st_size)
+        except OSError as exc:
+            self._send_to_allowed_chats(f"历史文件准备失败：{exc}")
+            self._errors.put(str(exc))
+            return
+        self._send_to_allowed_chats(
+            f"正在发送{'原始' if raw else '清理后'}历史文件：{send_path.name} ({size_text})。"
+        )
         for chat_id in self.config.allowed_chat_ids:
             try:
                 caption = "TeleAgent raw history" if raw else "TeleAgent clean history"
                 self._client.send_document(chat_id, send_path, caption=caption)
             except (RuntimeError, urllib.error.URLError, OSError) as exc:
+                self._send_to_allowed_chats(f"历史文件发送失败：{exc}")
                 self._errors.put(str(exc))
 
     def pop_errors(self) -> list[str]:
@@ -1382,6 +1409,18 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 20].rstrip() + "\n...[truncated]"
+
+
+def _format_bytes(size: int) -> str:
+    units = ("B", "KB", "MB", "GB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
 
 
 def _normalize_output_source_name(name: str) -> str:
@@ -2237,6 +2276,7 @@ def _selection_menu_title(options: list[str]) -> str:
 
 def parse_telegram_input(text: str) -> TelegramInput:
     stripped = text.strip()
+    stripped = _strip_telegram_bot_suffix(stripped)
     if stripped == "/start":
         return TelegramInput(TelegramInputKind.IGNORE, stripped)
     ta_command = _parse_teleagent_command(stripped)
@@ -2252,7 +2292,19 @@ def parse_telegram_input(text: str) -> TelegramInput:
         return TelegramInput(TelegramInputKind.SEND, stripped[len("/send ") :])
     if stripped.startswith("/key "):
         return TelegramInput(TelegramInputKind.KEY, stripped[len("/key ") :].strip())
+    if stripped != text.strip() and stripped.startswith("/"):
+        return TelegramInput(TelegramInputKind.SEND, stripped)
     return TelegramInput(TelegramInputKind.SEND, text)
+
+
+def _strip_telegram_bot_suffix(text: str) -> str:
+    match = re.match(
+        r"^/(?P<command>[A-Za-z0-9_]+)@[A-Za-z0-9_]+(?P<rest>\s.*)?$",
+        text,
+    )
+    if not match:
+        return text
+    return f"/{match.group('command')}{match.group('rest') or ''}"
 
 
 def _parse_teleagent_command(stripped: str) -> str | None:
@@ -2313,6 +2365,22 @@ def _terminal_chunk_has_pending_signal(text: str) -> bool:
     return any(
         not _is_terminal_noise_only_line(_strip_line_edge_noise(line).strip())
         for line in lines
+    )
+
+
+def _terminal_raw_has_active_status(text: str) -> bool:
+    visible = _visible_terminal_text(text)
+    visible = _strip_terminal_control_fragments(visible)
+    normalized = re.sub(r"\s+", " ", visible)
+    return bool(
+        re.search(
+            r"(?i)\b\d+\s+background\s*terminals?\s+runn?ing\b",
+            normalized,
+        )
+        or re.search(r"(?i)\bbackground\s*terminal\s+runn?g\b", normalized)
+        or re.search(r"(?i)\b(?:esc\s+to\s+interrupt|/ps\s+to\s+view|/stop\s+to\s+close)\b", normalized)
+        or re.search(r"(?i)\bW(?:aiting|aited)\s+for\s+background\s+terminal\b", normalized)
+        or re.search(r"(?i)\bait(?:ing|ed)\s+for\s+background\s+terminal\b", normalized)
     )
 
 
@@ -2766,7 +2834,24 @@ def _strip_inline_terminal_ui_noise(text: str) -> str:
         flags=re.IGNORECASE,
     )
     text = re.sub(
+        r"\s*[•·]?\s*\d+\s+background\s*terminals?\s+runn?g\s*[•·]?\s*/[ps]?\s*to\s*view\s*[•·]?\s*/stop\w*\s*(?:to|o)?\s*close\w*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
         r"\s*\d+s\s+runing\s*[•·]?\s*/ps to view\s*[•·]?\s*/stop to close\w*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?im)^\s*[•·]?\s*(?:W?ait(?:ed|ing)|ait(?:ed|ing))\s+for\s+background\s+terminal\b[^\n]*",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"\s*[•·]?\s*(?:W?ait(?:ed|ing)|ait(?:ed|ing))\s+for\s+background\s+terminal\b[^\n]*",
         "",
         text,
         flags=re.IGNORECASE,

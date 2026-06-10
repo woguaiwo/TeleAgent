@@ -27,6 +27,7 @@ from teleagent.telegram import (
     _format_for_mobile,
     _remove_recent_user_echoes,
     _terminal_chunk_has_pending_signal,
+    _terminal_raw_has_active_status,
     _terminal_snapshot_text,
     parse_telegram_input,
 )
@@ -957,6 +958,12 @@ class TelegramInputTest(unittest.TestCase):
         self.assertEqual(action.kind, TelegramInputKind.COMMAND)
         self.assertEqual(action.text, "/history")
 
+    def test_history_command_with_bot_suffix(self) -> None:
+        action = parse_telegram_input("/history@TeleAgentBot")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/history")
+
     def test_raw_history_command(self) -> None:
         action = parse_telegram_input("/rawhistory")
 
@@ -971,6 +978,12 @@ class TelegramInputTest(unittest.TestCase):
 
     def test_model_slash_command_is_forwarded_to_cli(self) -> None:
         action = parse_telegram_input("/model gpt-5")
+
+        self.assertEqual(action.kind, TelegramInputKind.SEND)
+        self.assertEqual(action.text, "/model gpt-5")
+
+    def test_model_slash_command_with_bot_suffix_is_forwarded_cleanly(self) -> None:
+        action = parse_telegram_input("/model@TeleAgentBot gpt-5")
 
         self.assertEqual(action.kind, TelegramInputKind.SEND)
         self.assertEqual(action.text, "/model gpt-5")
@@ -1804,6 +1817,19 @@ class TerminalCleanTest(unittest.TestCase):
         self.assertNotIn("tab to queue", formatted)
         self.assertNotIn("context left", formatted)
 
+    def test_reid_corrupted_background_status_is_removed(self) -> None:
+        raw = (
+            "一句话结论：坐标轴问题基本解决后，我们正在转向优化 acc 的物理生成。"
+            "  1 backgroundterminal runng · /s toview · /stopo close"
+        )
+
+        formatted = _format_for_mobile(raw)
+
+        self.assertEqual(
+            formatted,
+            "一句话结论：坐标轴问题基本解决后，我们正在转向优化 acc 的物理生成。",
+        )
+
     def test_reid_inline_manual_input_echo_is_removed(self) -> None:
         raw = (
             "回答前半句。"
@@ -2429,6 +2455,9 @@ class TelegramDebugBridgeTest(unittest.TestCase):
 
             records = _read_debug_records(outbox)
 
+            messages = [record["text"] for record in records if record["type"] == "message"]
+            self.assertEqual(len(messages), 1)
+            self.assertIn("正在发送清理后历史文件", messages[0])
             documents = [record for record in records if record["type"] == "document"]
             self.assertEqual(len(documents), 1)
             clean_path = Path(str(documents[0]["path"]))
@@ -2437,6 +2466,46 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             self.assertIn("一句话结论：保留这句。", clean_text)
             self.assertNotIn("Select Model", clean_text)
             self.assertNotIn("gpt-5.5", clean_text)
+
+    def test_history_command_reports_document_send_failure(self) -> None:
+        class FailingDocumentClient:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            def send_message(self, chat_id: int, text: str) -> None:
+                del chat_id
+                self.messages.append(text)
+
+            def send_document(self, chat_id: int, path: Path, *, caption: str = "") -> None:
+                del chat_id, path, caption
+                raise OSError("send failed")
+
+            def close(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            history = Path(tmp) / "teleagent-history.log"
+            history.write_text("一句话结论：保留这句。", encoding="utf-8")
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(Path(tmp) / "outbox.jsonl"),
+                    history_path=str(history),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                )
+            )
+            client = FailingDocumentClient()
+            bridge._client = client
+            try:
+                bridge.handle_command("/history")
+            finally:
+                bridge.close()
+
+        self.assertTrue(any("正在发送清理后历史文件" in message for message in client.messages))
+        self.assertTrue(any("历史文件发送失败" in message for message in client.messages))
 
     def test_menu_choice_consumes_numeric_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3452,6 +3521,46 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("摘要请求超时", messages[1])
         self.assertIn("这是很长的原始输出。", messages[2])
         self.assertIn("...[truncated]", messages[2])
+
+    def test_long_terminal_output_with_active_background_does_not_request_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_timeout_seconds=0,
+                )
+            )
+            try:
+                bridge.record_output(
+                    ("一句话结论：当前任务仍在跑，已经有阶段性结果。" * 12)
+                    + "\n• Working (14m 29s • esc to interrupt) · "
+                    + "1 background terminal running · /ps to view · /stop to close"
+                )
+                prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(prompt)
+        self.assertTrue(
+            _terminal_raw_has_active_status(
+                "1 background terminal running · /ps to view · /stop to close"
+            )
+        )
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("暂不自动插入摘要请求", messages[0])
 
     def test_long_output_without_auto_summary_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
