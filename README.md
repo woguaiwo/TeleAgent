@@ -18,12 +18,28 @@ Highlights:
 
 ## Quick start
 
-Install from a local checkout:
+Install from a local checkout and create your global default config:
 
 ```bash
 git clone https://github.com/woguaiwo/TeleAgent.git
 cd TeleAgent
+./install.sh
+```
+
+The installer runs `pip install -e .`, then creates:
+
+- `~/.config/teleagent/teleagent.toml`
+- `~/.config/teleagent/telegram-token`
+
+It asks whether to configure Telegram. If you skip Telegram setup, TeleAgent is
+still installed and can run locally, but phone bridging stays disabled until you
+edit the config.
+
+Manual install:
+
+```bash
 python -m pip install -e .
+teleagent --init-global
 ```
 
 Run an agent from the project directory you want it to work in:
@@ -53,6 +69,10 @@ initializes a project-local config:
 This lets each project start from your defaults while still allowing later
 per-project edits.
 
+`pip install` itself does not write to your home directory. Use `./install.sh`
+or `teleagent --init-global` when you want TeleAgent to create the global
+defaults explicitly.
+
 Set `settings.default_command` in `teleagent.toml` to run `teleagent` directly:
 
 ```toml
@@ -81,8 +101,20 @@ python -m teleagent -c examples/teleagent.toml --dry-run -- codex
 ## Telegram bridge
 
 Telegram is disabled in the public example config. To enable it, create a
-Telegram bot with BotFather, write its token to a local file, and add your chat
-id to the config:
+Telegram bot with BotFather, initialize your global config, write its token to
+the token file, and add your chat id:
+
+```bash
+teleagent --init-global --enable-telegram --telegram-chat-id 123456789
+```
+
+Then paste your bot token into:
+
+```bash
+~/.config/teleagent/telegram-token
+```
+
+Equivalent manual setup:
 
 ```bash
 mkdir -p ~/.config/teleagent

@@ -708,6 +708,68 @@ allowed_chat_ids = [123]
             self.assertEqual(copy_error, "")
             self.assertFalse(local_path.exists())
 
+    def test_init_global_creates_home_config_and_token_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["HOME"] = tmp
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "--init-global",
+                    "--global-default-command",
+                    "kimi",
+                    "--enable-telegram",
+                    "--telegram-chat-id",
+                    "123",
+                    "--telegram-chat-id",
+                    "456",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config_path = Path(tmp) / ".config" / "teleagent" / "teleagent.toml"
+            token_path = Path(tmp) / ".config" / "teleagent" / "telegram-token"
+            self.assertTrue(config_path.exists())
+            self.assertTrue(token_path.exists())
+            config = WrapperConfig.load(config_path)
+            self.assertEqual(config.default_command, ("kimi",))
+            self.assertTrue(config.telegram.enabled)
+            self.assertEqual(config.telegram.allowed_chat_ids, (123, 456))
+            self.assertEqual(config.telegram.token_file, "~/.config/teleagent/telegram-token")
+
+    def test_init_global_rejects_invalid_chat_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["HOME"] = tmp
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "--init-global",
+                    "--telegram-chat-id",
+                    "not-a-number",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("invalid --telegram-chat-id", result.stderr)
+            self.assertFalse((Path(tmp) / ".config" / "teleagent" / "teleagent.toml").exists())
+
 
 class TelegramInputTest(unittest.TestCase):
     def test_default_message_sends_and_enters(self) -> None:

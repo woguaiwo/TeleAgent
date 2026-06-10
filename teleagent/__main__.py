@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import shutil
@@ -12,6 +13,8 @@ from .wrapper import WrapperConfig, _config_for_command, run_wrapped
 
 
 LOCAL_CONFIG_PATH = Path("teleagent.toml")
+GLOBAL_CONFIG_DIR = Path.home() / ".config" / "teleagent"
+GLOBAL_TOKEN_PATH = GLOBAL_CONFIG_DIR / "telegram-token"
 DEFAULT_PROJECT_CONFIG = """
 [settings]
 buffer_size = 8192
@@ -68,6 +71,10 @@ pattern = "start new session\\\\?\\\\s*\\\\[y/N\\\\]"
 reply = "y"
 once = true
 """
+DEFAULT_GLOBAL_CONFIG = DEFAULT_PROJECT_CONFIG.replace(
+    'token_file = ".teleagent/telegram-token"',
+    'token_file = "~/.config/teleagent/telegram-token"',
+)
 
 
 def _global_config_path() -> Path:
@@ -104,6 +111,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print configuration diagnostics and exit without starting the wrapped command.",
     )
     parser.add_argument(
+        "--init-global",
+        action="store_true",
+        help="Create ~/.config/teleagent/teleagent.toml and the global token file, then exit.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --init-global, overwrite an existing global config.",
+    )
+    parser.add_argument(
+        "--global-default-command",
+        default=None,
+        help='With --init-global, set settings.default_command, for example "codex" or "kimi".',
+    )
+    parser.add_argument(
+        "--enable-telegram",
+        action="store_true",
+        help="With --init-global, set telegram.enabled = true.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        action="append",
+        default=[],
+        help="With --init-global, add an allowed Telegram chat id. May be repeated.",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Command to run after --, for example: -- codex",
@@ -113,6 +146,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.init_global:
+        return _init_global_config(
+            force=args.force,
+            default_command=args.global_default_command,
+            enable_telegram=args.enable_telegram,
+            chat_ids=args.telegram_chat_id,
+        )
+
     config_path, initialized_from, copy_error = _resolve_config_path_with_status(
         args.config,
         create_local=not args.print_config_path,
@@ -205,6 +246,107 @@ def _write_default_project_config(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     (path.parent / ".teleagent").mkdir(exist_ok=True)
     path.write_text(textwrap.dedent(DEFAULT_PROJECT_CONFIG).lstrip(), encoding="utf-8")
+
+
+def _init_global_config(
+    *,
+    force: bool,
+    default_command: str | None,
+    enable_telegram: bool,
+    chat_ids: list[str],
+) -> int:
+    config_path = _global_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.parent.chmod(0o700)
+
+    parsed_chat_ids, chat_id_error = _parse_chat_ids(chat_ids)
+    if chat_id_error:
+        print(chat_id_error, file=sys.stderr)
+        return 2
+
+    parsed_default_command: list[str] | None = None
+    if default_command:
+        try:
+            parsed_default_command = shlex.split(default_command)
+        except ValueError as exc:
+            print(f"teleagent: invalid --global-default-command: {exc}", file=sys.stderr)
+            return 2
+        if not parsed_default_command:
+            print("teleagent: --global-default-command cannot be empty", file=sys.stderr)
+            return 2
+
+    created_config = False
+    if config_path.exists() and not force:
+        print(f"global config already exists: {config_path}")
+        print("use --force with --init-global to overwrite it")
+    else:
+        config_text = _render_global_config(
+            default_command=parsed_default_command,
+            enable_telegram=enable_telegram,
+            chat_ids=parsed_chat_ids,
+        )
+        config_path.write_text(config_text, encoding="utf-8")
+        config_path.chmod(0o600)
+        created_config = True
+        action = "overwrote" if force else "created"
+        print(f"{action} global config: {config_path}")
+
+    try:
+        config = WrapperConfig.load(config_path)
+        token_file = config.telegram.token_file or str(GLOBAL_TOKEN_PATH)
+    except (OSError, ValueError):
+        token_file = str(GLOBAL_TOKEN_PATH)
+    token_path = Path(token_file).expanduser()
+    _ensure_private_file(token_path)
+    print(f"created token file if missing: {token_path}")
+
+    if created_config and not enable_telegram:
+        print("telegram is disabled by default; edit the config or rerun with --enable-telegram")
+    elif enable_telegram and not parsed_chat_ids:
+        print("telegram is enabled, but allowed_chat_ids is empty; add your chat id before running")
+    return 0
+
+
+def _render_global_config(
+    *,
+    default_command: list[str] | None,
+    enable_telegram: bool,
+    chat_ids: list[int],
+) -> str:
+    text = textwrap.dedent(DEFAULT_GLOBAL_CONFIG).lstrip()
+    if default_command is not None:
+        text = text.replace(
+            'default_command = ["codex"]',
+            f"default_command = {json.dumps(default_command)}",
+            1,
+        )
+    if enable_telegram:
+        text = text.replace("enabled = false", "enabled = true", 1)
+    if chat_ids:
+        text = text.replace("allowed_chat_ids = []", f"allowed_chat_ids = {chat_ids}", 1)
+    return text
+
+
+def _parse_chat_ids(raw_chat_ids: list[str]) -> tuple[list[int], str]:
+    parsed: list[int] = []
+    for raw in raw_chat_ids:
+        pieces = [piece.strip() for piece in raw.split(",")]
+        for piece in pieces:
+            if not piece:
+                continue
+            try:
+                parsed.append(int(piece))
+            except ValueError:
+                return [], f"teleagent: invalid --telegram-chat-id value: {piece!r}"
+    return parsed, ""
+
+
+def _ensure_private_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.parent != Path("."):
+        path.parent.chmod(0o700)
+    path.touch(mode=0o600, exist_ok=True)
+    path.chmod(0o600)
 
 
 def _prepare_runtime_files(config: WrapperConfig) -> list[str]:
