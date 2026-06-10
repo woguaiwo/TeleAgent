@@ -26,6 +26,7 @@ from teleagent.telegram import (
     _extract_selection_menu,
     _format_for_mobile,
     _remove_recent_user_echoes,
+    _terminal_chunk_has_pending_signal,
     _terminal_snapshot_text,
     parse_telegram_input,
 )
@@ -1184,6 +1185,23 @@ class TerminalCleanTest(unittest.TestCase):
         )
         self.assertEqual(menu.selected_index, 0)
 
+    def test_extract_kimi_sessions_menu_without_footer_controls(self) -> None:
+        raw = (
+            "SESSIONS (1 of 1)  [current directory]\n"
+            "┌──────────────────────────────────|  Sessions  |───────────────────────────────────┐\n"
+            "│                                                                                   │\n"
+            "│ ❯ Novel Team                                                                      │\n"
+            "│   31m ago · 073b7057                                                              │\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(menu.title, "请选择会话：")
+        self.assertEqual(menu.options, ("Novel Team (31m ago · 073b7057)",))
+        self.assertEqual(menu.selected_index, 0)
+
     def test_extract_kimi_sessions_ignores_post_choice_redraw_noise(self) -> None:
         raw = (
             "┌────────────────────| Sessions |────────────────────┐\n"
@@ -1709,6 +1727,31 @@ class TerminalCleanTest(unittest.TestCase):
         for raw in ("18;3H", "[18;2H", "4;35H1", "9mork", "ng"):
             with self.subTest(raw=raw):
                 self.assertEqual(_format_for_mobile(raw), "")
+
+    def test_reid_control_fragment_before_reply_text_is_removed(self) -> None:
+        raw = ";2H\n\n- 说明官方 skeleton quaternion 和关节位置几乎完全自洽。"
+
+        self.assertEqual(
+            _format_for_mobile(raw),
+            "- 说明官方 skeleton quaternion 和关节位置几乎完全自洽。",
+        )
+
+    def test_terminal_pending_signal_ignores_status_redraws(self) -> None:
+        reply = (
+            "\x1b[18;2H关键实验结果：\n\n"
+            "- 几何自洽验证：\n"
+            "  - 370/370 个骨段 case 最优都是 parent|local_to_world\n"
+        )
+        redraw_noise = (
+            "\x1b]0;⠙ ReID_imu_generation\x07"
+            "\x1b[15;2H\x1b[0m\x1b[49m\x1b[K"
+            "\x1b[16;2H\x1b[0m\x1b[49m\x1b[K"
+            "\x1b[18;3H\x1b[?2026l"
+            "\x1b[20;97H3"
+        )
+
+        self.assertTrue(_terminal_chunk_has_pending_signal(reply))
+        self.assertFalse(_terminal_chunk_has_pending_signal(redraw_noise))
 
     def test_reid_recent_filters_preserve_normal_numbers_and_text(self) -> None:
         cases = [
@@ -2927,6 +2970,43 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("2. hi (40m ago · 451c3264)", messages[0])
         self.assertIn("3. 1 (44m ago · 4a4914b9)", messages[0])
         self.assertIn("4. Hi (58m ago · f446825d)", messages[0])
+
+    def test_debug_bridge_sends_partial_kimi_resume_panel_as_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.record_output(
+                    "SESSIONS (1 of 1)  [current directory]\n"
+                    "┌──────────────────────────────────|  Sessions  |───────────────────────────────────┐\n"
+                    "│                                                                                   │\n"
+                    "│ ❯ Novel Team                                                                      │\n"
+                    "│   31m ago · 073b7057                                                              │\n"
+                )
+                bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("请选择会话", messages[0])
+        self.assertIn("1. Novel Team (31m ago · 073b7057) *", messages[0])
+        self.assertNotIn("SESSIONS", messages[0])
+        self.assertNotIn("┌", messages[0])
 
     def test_debug_bridge_suppresses_kimi_sessions_redraw_after_choice(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

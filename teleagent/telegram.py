@@ -961,9 +961,10 @@ class TelegramBridge:
         if not self.enabled:
             return
         _append_text(Path(self.config.raw_history_path), text)
-        self._pending_raw_output = (self._pending_raw_output + text)[
-            -_pending_raw_limit(self.config) :
-        ]
+        if _terminal_chunk_has_pending_signal(text):
+            self._pending_raw_output = (self._pending_raw_output + text)[
+                -_pending_raw_limit(self.config) :
+            ]
         self._last_output_at = time.monotonic()
 
     def flush_idle_output(self) -> str | None:
@@ -1713,11 +1714,10 @@ def _extract_kimi_sessions_menu(lines: list[str]) -> SelectionMenu | None:
         ):
             control_index = index
             break
-    if control_index is None:
-        return None
 
     header_index: int | None = None
-    for index in range(control_index - 1, -1, -1):
+    header_search_end = control_index if control_index is not None else len(normalized)
+    for index in range(header_search_end - 1, -1, -1):
         if re.search(r"(?i)\bsessions\b", normalized[index]):
             header_index = index
             break
@@ -1726,7 +1726,12 @@ def _extract_kimi_sessions_menu(lines: list[str]) -> SelectionMenu | None:
 
     options: list[str] = []
     selected_index: int | None = None
-    body = normalized[header_index + 1 : control_index]
+    body_end = control_index if control_index is not None else len(normalized)
+    body = [
+        line
+        for line in normalized[header_index + 1 : body_end]
+        if not re.search(r"(?i)\bsessions\b", line)
+    ]
     index = 0
     while index + 1 < len(body):
         title = body[index]
@@ -1752,7 +1757,7 @@ def _extract_kimi_sessions_menu(lines: list[str]) -> SelectionMenu | None:
             selected_index = options.index(label)
         index += 2
 
-    if len(options) < 2:
+    if not options:
         return None
     if selected_index is None:
         selected_index = 0
@@ -2245,8 +2250,36 @@ def _pending_raw_limit(config: TelegramConfig) -> int:
         config.summary_threshold_chars * 8,
         config.all_chunk_chars * 4,
         config.max_message_chars * 4,
-        65536,
+        1_000_000,
     )
+
+
+def _terminal_chunk_has_pending_signal(text: str) -> bool:
+    visible = _visible_terminal_text(text)
+    visible = _strip_terminal_control_fragments(visible)
+    if not visible.strip():
+        return False
+    lines = [line.strip() for line in visible.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return any(
+        not _is_terminal_noise_only_line(_strip_line_edge_noise(line).strip())
+        for line in lines
+    )
+
+
+def _is_terminal_noise_only_line(stripped: str) -> bool:
+    if not stripped:
+        return True
+    if _is_spinner_fragment_line(stripped):
+        return True
+    if _is_terminal_decoration_fragment_line(stripped):
+        return True
+    if re.fullmatch(r"(?:\[?\d{1,3};\d{1,3}[A-Za-z]\d*|;?\d{1,3}[A-Za-z])", stripped):
+        return True
+    if re.fullmatch(r"\d{1,3}", stripped):
+        return True
+    return False
 
 
 def _clean_terminal_text(text: str) -> str:
@@ -2321,6 +2354,7 @@ def _apply_backspaces(text: str) -> str:
 
 
 def _drop_terminal_ui_noise(text: str) -> str:
+    text = _strip_terminal_control_fragments(text)
     text = _strip_inline_composer_echoes(text)
     text = _strip_inline_terminal_ui_noise(text)
     text = _drop_plain_codex_menu_blocks(text)
@@ -2494,6 +2528,14 @@ def _drop_terminal_ui_noise(text: str) -> str:
         if cleaned_line.strip():
             kept_lines.append(cleaned_line)
     return "\n".join(kept_lines)
+
+
+def _strip_terminal_control_fragments(text: str) -> str:
+    control_fragment = r"(?:\[?\d{1,3};\d{1,3}[A-Za-z]\d*|;?\d{1,3};\d{1,3}[A-Za-z]\d*)"
+    text = re.sub(rf"(?m)^\s*{control_fragment}\s*$", "", text)
+    text = re.sub(rf"(?m)^\s*{control_fragment}\s*(?=\S)", "", text)
+    text = re.sub(rf"(?m)^\s*;?\d{{1,3}}[A-Za-z]\s*(?=\S)", "", text)
+    return text
 
 
 def _strip_sgr_fragment_noise(text: str) -> str:
