@@ -1,0 +1,32 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local TeleAgent state
+.teleagent/
+/teleagent.toml
+teleagent-history.log
+teleagent-raw.log
+teleagent-debug-inbox.txt
+teleagent-debug-outbox.jsonl
+teleagent-debug-runs/
+error.txt
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

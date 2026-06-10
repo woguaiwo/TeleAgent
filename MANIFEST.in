@@ -1,0 +1,26 @@
+include LICENSE
+include README.md
+include pyproject.toml
+include .gitignore
+include .gitattributes
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include REPOSITORY_SETUP.md
+recursive-include teleagent *.py
+recursive-include tests *.py
+recursive-include examples *.py *.toml
+recursive-include .github *.yml *.md
+global-exclude __pycache__/*
+global-exclude *.py[cod]
+global-exclude *.egg-info/*
+recursive-exclude .teleagent *
+recursive-exclude teleagent-debug-runs *
+recursive-exclude build *
+recursive-exclude dist *
+exclude teleagent.toml
+exclude teleagent-history.log
+exclude teleagent-raw.log
+exclude teleagent-debug-inbox.txt
+exclude teleagent-debug-outbox.jsonl
+exclude error.txt

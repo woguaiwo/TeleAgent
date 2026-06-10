@@ -1,0 +1,29 @@
+name: Bug Report
+description: Report a reproducible TeleAgent problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include commands, config snippets, and debug-mode outbox when relevant. Remove tokens and chat IDs.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "OS, Python version, wrapped CLI"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Paste only sanitized excerpts. Do not include tokens, chat IDs, or private project data.

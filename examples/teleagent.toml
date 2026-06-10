@@ -1,0 +1,54 @@
+[settings]
+buffer_size = 8192
+log_matches = true
+default_command = ["codex"]
+
+[telegram]
+enabled = false
+token_env = "TELEGRAM_BOT_TOKEN"
+token_file = "~/.config/teleagent/telegram-token"
+allowed_chat_ids = []
+debug_mode = false
+debug_inbox_path = "teleagent-debug-inbox.txt"
+debug_outbox_path = "teleagent-debug-outbox.jsonl"
+debug_chat_id = 0
+forward_patterns = [
+  "Final answer:[ \\t]*([^\\r\\n]*)",
+  "Conclusion:[ \\t]*([^\\r\\n]*)",
+]
+poll_timeout = 20
+max_message_chars = 3500
+history_path = "teleagent-history.log"
+raw_history_path = "teleagent-raw.log"
+output_mode = "summary"
+output_sources = ["terminal"]
+codex_state_root = "~/.codex"
+kimi_state_root = "~/.kimi"
+idle_forward_seconds = 3.0
+all_chunk_chars = 2500
+summary_threshold_chars = 1200
+summary_max_chars = 800
+auto_summary = true
+summary_timeout_seconds = 30.0
+summary_fallback_chars = 3500
+input_submit_delay_seconds = 0.05
+input_submit_keys = ["enter", "linefeed"]
+summary_submit_delay_seconds = 0.2
+summary_submit_keys = ["enter", "linefeed"]
+summary_prompt_template = "请把你刚才过长的回复总结成 {max_chars} 字以内。面向手机聊天阅读：先给一句话结论，再用短条目列关键点；不要复述完整原文。"
+
+[[rules]]
+name = "generic-yes-no-continue"
+pattern = "(continue|proceed)\\?\\s*\\[y/N\\]"
+reply = "y"
+
+[[rules]]
+name = "generic-numbered-choice-first"
+pattern = "enter choice\\s*:"
+reply = "1"
+
+[[rules]]
+name = "once-confirm-start"
+pattern = "start new session\\?\\s*\\[y/N\\]"
+reply = "y"
+once = true
