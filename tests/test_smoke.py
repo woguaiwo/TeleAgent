@@ -585,6 +585,40 @@ allowed_chat_ids = [123]
 
         self.assertEqual(resolved_token, "file-token")
 
+    def test_telegram_token_file_expands_environment_variables(self) -> None:
+        previous_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        previous_home = os.environ.get("TELEAGENT_HOME")
+        try:
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+            with tempfile.TemporaryDirectory() as tmp:
+                teleagent_home = Path(tmp) / "teleagent-home"
+                token_path = teleagent_home / ".config" / "teleagent" / "telegram-token"
+                token_path.parent.mkdir(parents=True)
+                token_path.write_text("env-file-token\n", encoding="utf-8")
+                os.environ["TELEAGENT_HOME"] = str(teleagent_home)
+                config_path = Path(tmp) / "teleagent.toml"
+                config_path.write_text(
+                    """
+[telegram]
+enabled = true
+token_file = "$TELEAGENT_HOME/.config/teleagent/telegram-token"
+allowed_chat_ids = [123]
+""",
+                    encoding="utf-8",
+                )
+
+                config = WrapperConfig.load(config_path)
+                resolved_token = config.telegram.resolved_token()
+        finally:
+            if previous_token is not None:
+                os.environ["TELEGRAM_BOT_TOKEN"] = previous_token
+            if previous_home is None:
+                os.environ.pop("TELEAGENT_HOME", None)
+            else:
+                os.environ["TELEAGENT_HOME"] = previous_home
+
+        self.assertEqual(resolved_token, "env-file-token")
+
     def test_explicit_config_path_expands_user(self) -> None:
         self.assertEqual(_resolve_config_path("~/teleagent.toml"), Path.home() / "teleagent.toml")
 
@@ -712,6 +746,8 @@ allowed_chat_ids = [123]
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
             env["HOME"] = tmp
+            env.pop("TELEAGENT_HOME", None)
+            env.pop("TELEAGENT_CONFIG_DIR", None)
             result = subprocess.run(
                 [
                     sys.executable,
@@ -743,12 +779,90 @@ allowed_chat_ids = [123]
             self.assertEqual(config.default_command, ("kimi",))
             self.assertTrue(config.telegram.enabled)
             self.assertEqual(config.telegram.allowed_chat_ids, (123, 456))
-            self.assertEqual(config.telegram.token_file, "~/.config/teleagent/telegram-token")
+            self.assertEqual(config.telegram.token_file, str(token_path))
+
+    def test_init_global_can_use_teleagent_home_instead_of_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            real_home = tmp_path / "real-home"
+            teleagent_home = tmp_path / "teleagent-home"
+            env = os.environ.copy()
+            env["HOME"] = str(real_home)
+            env["TELEAGENT_HOME"] = str(teleagent_home)
+            env.pop("TELEAGENT_CONFIG_DIR", None)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "--init-global",
+                    "--global-default-command",
+                    "codex",
+                    "--enable-telegram",
+                    "--telegram-chat-id",
+                    "123",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config_path = teleagent_home / ".config" / "teleagent" / "teleagent.toml"
+            token_path = teleagent_home / ".config" / "teleagent" / "telegram-token"
+            self.assertTrue(config_path.exists())
+            self.assertTrue(token_path.exists())
+            self.assertFalse((real_home / ".config" / "teleagent").exists())
+            config = WrapperConfig.load(config_path)
+            self.assertEqual(config.telegram.token_file, str(token_path))
+
+    def test_init_global_can_use_explicit_config_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            real_home = tmp_path / "real-home"
+            config_dir = tmp_path / "custom-config"
+            env = os.environ.copy()
+            env["HOME"] = str(real_home)
+            env["TELEAGENT_CONFIG_DIR"] = str(config_dir)
+            env.pop("TELEAGENT_HOME", None)
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "--init-global",
+                    "--global-default-command",
+                    "kimi",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config_path = config_dir / "teleagent.toml"
+            token_path = config_dir / "telegram-token"
+            self.assertTrue(config_path.exists())
+            self.assertTrue(token_path.exists())
+            self.assertFalse((real_home / ".config" / "teleagent").exists())
+            config = WrapperConfig.load(config_path)
+            self.assertEqual(config.default_command, ("kimi",))
+            self.assertEqual(config.telegram.token_file, str(token_path))
 
     def test_init_global_rejects_invalid_chat_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
             env["HOME"] = tmp
+            env.pop("TELEAGENT_HOME", None)
+            env.pop("TELEAGENT_CONFIG_DIR", None)
             result = subprocess.run(
                 [
                     sys.executable,

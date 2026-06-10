@@ -277,7 +277,8 @@ class TelegramConfig:
             return env_token
         if self.token_file:
             try:
-                return Path(self.token_file).expanduser().read_text(encoding="utf-8").strip()
+                token_path = Path(os.path.expandvars(self.token_file)).expanduser()
+                return token_path.read_text(encoding="utf-8").strip()
             except OSError:
                 return ""
         return ""

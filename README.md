@@ -35,12 +35,27 @@ It asks whether to configure Telegram. If you skip Telegram setup, TeleAgent is
 still installed and can run locally, but phone bridging stays disabled until you
 edit the config.
 
+If your system home directory is quota-limited, answer the installer's
+`TeleAgent data home` prompt with a writable directory such as
+`/data/$USER/teleagent-home`. The generated launcher remembers that directory,
+so later `teleagent` runs do not need another `export`.
+
 Manual install:
 
 ```bash
 python -m pip install -e .
 teleagent --init-global
 ```
+
+Manual install with a home substitute:
+
+```bash
+TELEAGENT_HOME=/data/$USER/teleagent-home teleagent --init-global
+```
+
+For manual installs, keep `TELEAGENT_HOME` exported in your shell profile or
+prefix it when launching `teleagent`. The interactive `./install.sh` path writes
+a launcher that remembers the chosen directory for you.
 
 Run an agent from the project directory you want it to work in:
 
@@ -63,7 +78,7 @@ When you run `teleagent` without `-c/--config`, it first checks for
 `./teleagent.toml`. If the current directory does not have one, TeleAgent
 initializes a project-local config:
 
-- if `~/.config/teleagent/teleagent.toml` exists, it copies that file
+- if the global TeleAgent config exists, it copies that file
 - otherwise, it writes the built-in default template
 
 This lets each project start from your defaults while still allowing later
@@ -113,6 +128,9 @@ Then paste your bot token into:
 ```bash
 ~/.config/teleagent/telegram-token
 ```
+
+If you use `TELEAGENT_HOME` or `TELEAGENT_CONFIG_DIR`, run
+`teleagent --doctor` to see the exact token path.
 
 Equivalent manual setup:
 
@@ -324,9 +342,18 @@ Telegram is configured under `[telegram]` and is disabled by default in the
 public template.
 If no `-c/--config` is provided, TeleAgent looks for `./teleagent.toml`. When
 that file is missing, it initializes one in the current directory: first from
-`~/.config/teleagent/teleagent.toml` if available, otherwise from the built-in
-default template. `TELEAGENT_CONFIG` can override this and disables the
-automatic project initialization.
+the global TeleAgent config if available, otherwise from the built-in default
+template. `TELEAGENT_CONFIG` can override this and disables the automatic
+project initialization.
+
+Global config location:
+
+- default: `~/.config/teleagent/teleagent.toml`
+- with `TELEAGENT_HOME=/data/me/teleagent-home`:
+  `/data/me/teleagent-home/.config/teleagent/teleagent.toml`
+- with `TELEAGENT_CONFIG_DIR=/data/me/teleagent-config`:
+  `/data/me/teleagent-config/teleagent.toml`
+
 The config file location does not change the wrapped command's working
 directory; the wrapped command inherits the shell directory where `teleagent`
 was started.
