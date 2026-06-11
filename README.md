@@ -172,6 +172,9 @@ poll_timeout = 20
 max_message_chars = 3500
 history_path = "teleagent-history.log"
 raw_history_path = "teleagent-raw.log"
+diagnostic_log_path = "teleagent-diagnostics.jsonl"
+diagnostic_retention_days = 7.0
+diagnostic_snippet_chars = 240
 output_mode = "summary"
 output_sources = ["terminal"]
 codex_state_root = "~/.codex"
@@ -183,6 +186,7 @@ summary_max_chars = 800
 auto_summary = true
 summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
+background_terminal_timeout_seconds = 600.0
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
 slash_submit_delay_seconds = 0.2
@@ -211,6 +215,8 @@ Telegram input controls:
 - `/ta summary`: switch Telegram back to summary mode
 - `/ta history`: send the full local output history file to Telegram
 - `/ta rawhistory`: send the raw PTY output file for debugging terminal rendering
+- `/ta diagnostics`: send the structured diagnostics JSONL file
+- `/ta status`: show TeleAgent summary state, including background-terminal state
 - `/ta auto start`: after each model reply, send `请继续推进，并且在合适的时候记录进展在 log 里`
 - `/ta auto 7.5`: enable auto mode for 7.5 hours; very small hour values are valid for testing
 - `/ta auto end`: stop auto mode and wait for user replies again
@@ -256,6 +262,10 @@ TeleAgent now supports both full output and summary output:
 - All model output is appended to `history_path`.
 - Raw terminal output is appended to `raw_history_path`; this may contain ANSI
   escape sequences and TUI redraw data.
+- Wrapper state-machine diagnostics are appended to `diagnostic_log_path` as
+  JSONL and pruned to the last `diagnostic_retention_days` days by default.
+  These records include short snippets, lengths, hashes, background-terminal
+  state, summary/auto-injection decisions, and input routing decisions.
 - `output_sources = ["terminal"]` keeps the existing UI/terminal reader as the
   default path. This is also the default UI mode for `codex`, `claude`, and
   `kimi`.
@@ -399,9 +409,10 @@ an approval request. For sensitive operations, prefer `--dry-run` first.
 ## Security
 
 Never commit Telegram bot tokens, real chat IDs, `.teleagent/`,
-`teleagent-history.log`, `teleagent-raw.log`, or debug inbox/outbox files. Raw
-terminal captures can contain private prompts, command transcripts, paths, and
-secrets. See `SECURITY.md` for details.
+`teleagent-history.log`, `teleagent-raw.log`, `teleagent-diagnostics.jsonl`, or
+debug inbox/outbox files. Raw terminal captures and diagnostics can contain
+private prompts, command transcripts, paths, and secrets. See `SECURITY.md` for
+details.
 
 ## License
 

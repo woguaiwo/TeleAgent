@@ -40,6 +40,9 @@ poll_timeout = 20
 max_message_chars = 3500
 history_path = "teleagent-history.log"
 raw_history_path = "teleagent-raw.log"
+diagnostic_log_path = "teleagent-diagnostics.jsonl"
+diagnostic_retention_days = 7.0
+diagnostic_snippet_chars = 240
 output_mode = "summary"
 output_sources = ["terminal"]
 codex_state_root = "~/.codex"
@@ -51,6 +54,7 @@ summary_max_chars = 800
 auto_summary = true
 summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
+background_terminal_timeout_seconds = 600.0
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
 slash_submit_delay_seconds = 0.2
@@ -514,6 +518,9 @@ def _print_doctor(config_path: Path, config: WrapperConfig, command: list[str]) 
         print(f"telegram.token_file_has_value: {token_file_has_value}")
     print(f"telegram.history_path: {telegram.history_path}")
     print(f"telegram.raw_history_path: {telegram.raw_history_path}")
+    print(f"telegram.diagnostic_log_path: {telegram.diagnostic_log_path}")
+    print(f"telegram.diagnostic_retention_days: {telegram.diagnostic_retention_days}")
+    print(f"telegram.diagnostic_snippet_chars: {telegram.diagnostic_snippet_chars}")
     print(f"telegram.output_mode: {telegram.output_mode}")
     print(f"telegram.output_sources: {list(telegram.output_sources)!r}")
     print(f"telegram.codex_state_root: {telegram.codex_state_root}")
@@ -523,6 +530,10 @@ def _print_doctor(config_path: Path, config: WrapperConfig, command: list[str]) 
     print(f"telegram.summary_max_chars: {telegram.summary_max_chars}")
     print(f"telegram.summary_timeout_seconds: {telegram.summary_timeout_seconds}")
     print(f"telegram.summary_fallback_chars: {telegram.summary_fallback_chars}")
+    print(
+        "telegram.background_terminal_timeout_seconds: "
+        f"{telegram.background_terminal_timeout_seconds}"
+    )
     print(f"telegram.input_submit_delay_seconds: {telegram.input_submit_delay_seconds}")
     print(f"telegram.input_submit_keys: {list(telegram.input_submit_keys)!r}")
     print(f"telegram.slash_submit_delay_seconds: {telegram.slash_submit_delay_seconds}")

@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
@@ -42,6 +42,11 @@ _RECENT_OUTPUT_FINGERPRINT_TTL_SECONDS = 60.0
 _MENU_CHOICE_SUPPRESS_SECONDS = 2.0
 _AUTO_CONTINUE_BUSY_GRACE_SECONDS = 5.0
 _AUTO_CONTINUE_PROMPT = "请继续推进，并且在合适的时候记录进展在 log 里"
+_HISTORY_FULL_CLEAN_MAX_BYTES = 750_000
+_HISTORY_FAILURE_PREVIEW_BYTES = 12_000
+_DIAGNOSTIC_TEXT_DEFAULT_CHARS = 240
+_BACKGROUND_STATUS_LOG_INTERVAL_SECONDS = 60.0
+_DIAGNOSTIC_PRUNE_INTERVAL_SECONDS = 300.0
 
 
 class TelegramInputKind(Enum):
@@ -86,6 +91,9 @@ class TelegramConfig:
     max_message_chars: int = 3500
     history_path: str = "teleagent-history.log"
     raw_history_path: str = "teleagent-raw.log"
+    diagnostic_log_path: str = "teleagent-diagnostics.jsonl"
+    diagnostic_snippet_chars: int = _DIAGNOSTIC_TEXT_DEFAULT_CHARS
+    diagnostic_retention_days: float = 7.0
     output_mode: str = "summary"
     output_sources: tuple[str, ...] = ("terminal",)
     codex_state_root: str = "~/.codex"
@@ -97,6 +105,7 @@ class TelegramConfig:
     auto_summary: bool = True
     summary_timeout_seconds: float = 30.0
     summary_fallback_chars: int = 3500
+    background_terminal_timeout_seconds: float = 600.0
     input_submit_delay_seconds: float = 0.05
     input_submit_keys: tuple[str, ...] = ("enter", "linefeed")
     slash_submit_delay_seconds: float = 0.2
@@ -160,6 +169,12 @@ class TelegramConfig:
             raise ValueError("telegram.max_message_chars must be an integer >= 100")
         history_path = data.get("history_path", "teleagent-history.log")
         raw_history_path = data.get("raw_history_path", "teleagent-raw.log")
+        diagnostic_log_path = data.get("diagnostic_log_path", "teleagent-diagnostics.jsonl")
+        diagnostic_snippet_chars = data.get(
+            "diagnostic_snippet_chars",
+            _DIAGNOSTIC_TEXT_DEFAULT_CHARS,
+        )
+        diagnostic_retention_days = data.get("diagnostic_retention_days", 7.0)
         output_mode = data.get("output_mode", "summary")
         output_sources_raw = data.get("output_sources", ["terminal"])
         codex_state_root = data.get("codex_state_root", "~/.codex")
@@ -171,6 +186,10 @@ class TelegramConfig:
         auto_summary = data.get("auto_summary", True)
         summary_timeout_seconds = data.get("summary_timeout_seconds", 30.0)
         summary_fallback_chars = data.get("summary_fallback_chars", 3500)
+        background_terminal_timeout_seconds = data.get(
+            "background_terminal_timeout_seconds",
+            600.0,
+        )
         input_submit_delay_seconds = data.get("input_submit_delay_seconds", 0.05)
         input_submit_keys = data.get("input_submit_keys", ["enter", "linefeed"])
         slash_submit_delay_seconds = data.get("slash_submit_delay_seconds", 0.2)
@@ -186,6 +205,12 @@ class TelegramConfig:
             raise ValueError("telegram.history_path must be a non-empty string")
         if not isinstance(raw_history_path, str) or not raw_history_path:
             raise ValueError("telegram.raw_history_path must be a non-empty string")
+        if not isinstance(diagnostic_log_path, str):
+            raise ValueError("telegram.diagnostic_log_path must be a string")
+        if not isinstance(diagnostic_snippet_chars, int) or diagnostic_snippet_chars < 0:
+            raise ValueError("telegram.diagnostic_snippet_chars must be an integer >= 0")
+        if not isinstance(diagnostic_retention_days, int | float) or diagnostic_retention_days < 0:
+            raise ValueError("telegram.diagnostic_retention_days must be a number >= 0")
         if output_mode not in ("summary", "all"):
             raise ValueError('telegram.output_mode must be "summary" or "all"')
         if not isinstance(output_sources_raw, list) or not output_sources_raw:
@@ -220,6 +245,13 @@ class TelegramConfig:
             raise ValueError("telegram.summary_timeout_seconds must be a number >= 0")
         if not isinstance(summary_fallback_chars, int) or summary_fallback_chars < 100:
             raise ValueError("telegram.summary_fallback_chars must be an integer >= 100")
+        if (
+            not isinstance(background_terminal_timeout_seconds, int | float)
+            or background_terminal_timeout_seconds < 0
+        ):
+            raise ValueError(
+                "telegram.background_terminal_timeout_seconds must be a number >= 0"
+            )
         if not isinstance(input_submit_delay_seconds, int | float) or input_submit_delay_seconds < 0:
             raise ValueError("telegram.input_submit_delay_seconds must be a number >= 0")
         if not isinstance(input_submit_keys, list) or not all(
@@ -261,6 +293,9 @@ class TelegramConfig:
             max_message_chars=max_message_chars,
             history_path=history_path,
             raw_history_path=raw_history_path,
+            diagnostic_log_path=diagnostic_log_path,
+            diagnostic_snippet_chars=diagnostic_snippet_chars,
+            diagnostic_retention_days=float(diagnostic_retention_days),
             output_mode=output_mode,
             output_sources=tuple(output_sources),
             codex_state_root=codex_state_root,
@@ -272,6 +307,7 @@ class TelegramConfig:
             auto_summary=auto_summary,
             summary_timeout_seconds=float(summary_timeout_seconds),
             summary_fallback_chars=summary_fallback_chars,
+            background_terminal_timeout_seconds=float(background_terminal_timeout_seconds),
             input_submit_delay_seconds=float(input_submit_delay_seconds),
             input_submit_keys=tuple(input_submit_keys),
             slash_submit_delay_seconds=float(slash_submit_delay_seconds),
@@ -888,6 +924,10 @@ class TelegramBridge:
         self._auto_continue_until: float | None = None
         self._pending_auto_continue_prompt: str | None = None
         self._terminal_busy_until = 0.0
+        self._background_terminal_seen_at: float | None = None
+        self._background_terminal_last_seen_at: float | None = None
+        self._background_terminal_last_log_at = 0.0
+        self._background_terminal_stale_notified = False
         self._structured_sources: dict[str, object] = {}
         if "codex_rollout" in config.output_sources:
             self._structured_sources["codex_rollout"] = _CodexRolloutOutputSource(
@@ -909,6 +949,19 @@ class TelegramBridge:
             )
         self._terminal_output_fingerprints: dict[str, float] = {}
         self._structured_output_fingerprints: dict[str, tuple[str, float]] = {}
+        self._diagnostic_last_pruned_at = 0.0
+        self._log_diagnostic(
+            "bridge_initialized",
+            enabled=config.enabled,
+            debug_mode=config.debug_mode,
+            output_mode=config.output_mode,
+            output_sources=list(config.output_sources),
+            history_path=config.history_path,
+            raw_history_path=config.raw_history_path,
+            diagnostic_log_path=config.diagnostic_log_path,
+            diagnostic_retention_days=config.diagnostic_retention_days,
+            allowed_chat_count=len(config.allowed_chat_ids),
+        )
 
     @property
     def enabled(self) -> bool:
@@ -918,13 +971,93 @@ class TelegramBridge:
     def read_fd(self) -> int:
         return self._read_fd
 
+    def _log_diagnostic(self, event: str, **fields: object) -> None:
+        if not self.config.enabled:
+            return
+        path_text = self.config.diagnostic_log_path
+        if not path_text:
+            return
+        now_epoch = time.time()
+        record = {
+            "ts": _diagnostic_utc_timestamp(now_epoch),
+            "event": event,
+            "cwd": str(Path.cwd()),
+            "elapsed_seconds": round(now_epoch - self._launched_at, 3),
+            "state": self._diagnostic_state(),
+        }
+        for key, value in fields.items():
+            record[key] = _diagnostic_json_value(value)
+        path = Path(os.path.expandvars(path_text)).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            prune_event = self._maybe_prune_diagnostic_log(path, now_epoch)
+            with path.open("a", encoding="utf-8", errors="replace") as handle:
+                if prune_event is not None:
+                    handle.write(json.dumps(prune_event, ensure_ascii=False, sort_keys=True) + "\n")
+                handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            return
+
+    def _maybe_prune_diagnostic_log(
+        self,
+        path: Path,
+        now_epoch: float,
+    ) -> dict[str, object] | None:
+        if now_epoch - self._diagnostic_last_pruned_at < _DIAGNOSTIC_PRUNE_INTERVAL_SECONDS:
+            return None
+        self._diagnostic_last_pruned_at = now_epoch
+        result = _prune_diagnostic_log(
+            path,
+            retention_days=self.config.diagnostic_retention_days,
+            now_epoch=now_epoch,
+        )
+        if result is None:
+            return None
+        return {
+            "ts": _diagnostic_utc_timestamp(now_epoch),
+            "event": "diagnostic_pruned",
+            "cwd": str(Path.cwd()),
+            "elapsed_seconds": round(now_epoch - self._launched_at, 3),
+            "state": self._diagnostic_state(),
+            **result,
+        }
+
+    def _diagnostic_state(self) -> dict[str, object]:
+        now = time.monotonic()
+        background_age = (
+            round(now - self._background_terminal_seen_at, 3)
+            if self._background_terminal_seen_at is not None
+            else None
+        )
+        return {
+            "mode": self._mode,
+            "awaiting_summary": self._awaiting_summary,
+            "pending_raw_len": len(self._pending_raw_output),
+            "restore_redraw_active": self._restore_redraw_active,
+            "auto_continue_enabled": self._auto_continue_enabled,
+            "pending_auto_continue": bool(self._pending_auto_continue_prompt),
+            "terminal_busy": now < self._terminal_busy_until,
+            "background_terminal_age_seconds": background_age,
+            "background_terminal_stale": self._background_terminal_is_stale(now),
+        }
+
+    def log_input_action(self, action: TelegramInput, *, target: str) -> None:
+        self._log_diagnostic(
+            "input_action",
+            target=target,
+            kind=action.kind.value,
+            **_diagnostic_text_fields("text", action.text, self.config.diagnostic_snippet_chars),
+        )
+
     def start(self) -> None:
         if not self.enabled:
             return
+        self._log_diagnostic("bridge_start")
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
     def close(self) -> None:
+        self._log_diagnostic("bridge_close")
         self._stop.set()
         client_close = getattr(self._client, "close", None)
         if callable(client_close):
@@ -951,7 +1084,18 @@ class TelegramBridge:
         if not chunks:
             return []
         raw = b"".join(chunks).decode(errors="replace")
-        return [parse_telegram_input(line) for line in raw.splitlines() if line]
+        actions = [parse_telegram_input(line) for line in raw.splitlines() if line]
+        for action in actions:
+            self._log_diagnostic(
+                "telegram_input_received",
+                kind=action.kind.value,
+                **_diagnostic_text_fields(
+                    "text",
+                    action.text,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+        return actions
 
     def maybe_forward_output(self, output_buffer: str) -> bool:
         if not self.enabled or self._client is None:
@@ -982,26 +1126,126 @@ class TelegramBridge:
         if not self.enabled:
             return
         _append_text(Path(self.config.raw_history_path), text)
-        if self._restore_redraw_active and _terminal_raw_has_ready_prompt(text):
+        has_ready_prompt = _terminal_raw_has_ready_prompt(text)
+        has_active_status = _terminal_raw_has_active_status(text)
+        if self._restore_redraw_active and has_ready_prompt:
             self._restore_redraw_ready_seen = True
-        if _terminal_raw_has_active_status(text):
+        if has_active_status:
+            self._mark_background_terminal_status(text)
             self._terminal_busy_until = time.monotonic() + max(
                 _AUTO_CONTINUE_BUSY_GRACE_SECONDS,
                 self.config.idle_forward_seconds,
             )
+        elif has_ready_prompt:
+            self._clear_background_terminal_status("ready_prompt")
         if _terminal_chunk_has_pending_signal(text):
+            if not self._pending_raw_output:
+                self._log_diagnostic(
+                    "terminal_pending_started",
+                    **_diagnostic_text_fields(
+                        "chunk",
+                        text,
+                        self.config.diagnostic_snippet_chars,
+                    ),
+                )
             self._pending_raw_output = (self._pending_raw_output + text)[
                 -_pending_raw_limit(self.config) :
             ]
         self._last_output_at = time.monotonic()
+
+    def _mark_background_terminal_status(self, text: str) -> None:
+        now = time.monotonic()
+        if self._background_terminal_seen_at is None:
+            self._background_terminal_seen_at = now
+            self._background_terminal_last_log_at = now
+            self._background_terminal_stale_notified = False
+            self._log_diagnostic(
+                "background_terminal_start",
+                **_diagnostic_text_fields(
+                    "chunk",
+                    text,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+        elif now - self._background_terminal_last_log_at >= _BACKGROUND_STATUS_LOG_INTERVAL_SECONDS:
+            self._background_terminal_last_log_at = now
+            self._log_diagnostic(
+                "background_terminal_still_active",
+                age_seconds=round(now - self._background_terminal_seen_at, 3),
+                **_diagnostic_text_fields(
+                    "chunk",
+                    text,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+        self._background_terminal_last_seen_at = now
+
+    def _clear_background_terminal_status(self, reason: str) -> None:
+        if self._background_terminal_seen_at is None:
+            return
+        now = time.monotonic()
+        self._log_diagnostic(
+            "background_terminal_clear",
+            reason=reason,
+            age_seconds=round(now - self._background_terminal_seen_at, 3),
+            last_seen_age_seconds=(
+                round(now - self._background_terminal_last_seen_at, 3)
+                if self._background_terminal_last_seen_at is not None
+                else None
+            ),
+        )
+        self._background_terminal_seen_at = None
+        self._background_terminal_last_seen_at = None
+        self._background_terminal_last_log_at = 0.0
+        self._background_terminal_stale_notified = False
+        self._terminal_busy_until = 0.0
+
+    def _background_terminal_is_stale(self, now: float | None = None) -> bool:
+        if self._background_terminal_seen_at is None:
+            return False
+        timeout = self.config.background_terminal_timeout_seconds
+        if timeout <= 0:
+            return False
+        if now is None:
+            now = time.monotonic()
+        return now - self._background_terminal_seen_at >= timeout
+
+    def _notify_background_terminal_stale_once(self) -> None:
+        if self._background_terminal_stale_notified:
+            return
+        if self._background_terminal_seen_at is None:
+            return
+        age_seconds = time.monotonic() - self._background_terminal_seen_at
+        self._background_terminal_stale_notified = True
+        self._log_diagnostic(
+            "background_terminal_stale",
+            age_seconds=round(age_seconds, 3),
+            timeout_seconds=self.config.background_terminal_timeout_seconds,
+        )
+        self._send_to_allowed_chats(
+            "检测到底层 CLI 的 background terminal 持续 "
+            f"{_format_duration(age_seconds)} 未恢复。已暂停自动注入，避免继续扰动会话。"
+            "可发送 /ps 查看底层任务，或发送 /stop 让底层 CLI 停止后台 terminal；"
+            "发送 /ta status 可查看 TeleAgent 状态。"
+        )
 
     def flush_idle_output(self) -> str | None:
         if not self.enabled:
             return None
         self._refresh_auto_continue_state()
         self._maybe_finish_restore_redraw_guard()
+        if self._background_terminal_is_stale():
+            self._notify_background_terminal_stale_once()
         auto_prompt = self._pop_auto_continue_prompt_if_ready()
         if auto_prompt:
+            self._log_diagnostic(
+                "auto_continue_prompt_ready",
+                **_diagnostic_text_fields(
+                    "prompt",
+                    auto_prompt,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
             return auto_prompt
         structured_polled: dict[str, str] = {}
         for source in self._structured_sources_before_terminal():
@@ -1018,6 +1262,10 @@ class TelegramBridge:
             and self._summary_requested_at is not None
             and time.monotonic() - self._summary_requested_at >= self.config.summary_timeout_seconds
         ):
+            self._log_diagnostic(
+                "summary_timeout",
+                timeout_seconds=self.config.summary_timeout_seconds,
+            )
             self._send_summary_fallback()
             return None
         if not self._pending_raw_output or self._last_output_at is None:
@@ -1144,6 +1392,14 @@ class TelegramBridge:
         if not self._auto_continue_is_active():
             return
         self._pending_auto_continue_prompt = _AUTO_CONTINUE_PROMPT
+        self._log_diagnostic(
+            "auto_continue_scheduled",
+            **_diagnostic_text_fields(
+                "prompt",
+                _AUTO_CONTINUE_PROMPT,
+                self.config.diagnostic_snippet_chars,
+            ),
+        )
 
     def _pop_auto_continue_prompt(self) -> str | None:
         if not self._auto_continue_is_active():
@@ -1159,6 +1415,10 @@ class TelegramBridge:
         if self._restore_redraw_active:
             return None
         if self._awaiting_summary or self._pending_raw_output:
+            return None
+        if self._background_terminal_seen_at is not None:
+            if self._background_terminal_is_stale():
+                self._notify_background_terminal_stale_once()
             return None
         if time.monotonic() < self._terminal_busy_until:
             return None
@@ -1249,11 +1509,14 @@ class TelegramBridge:
                 allow_auto_continue=allow_auto_continue,
             )
         if defer_auto_summary and not structured:
+            max_chars = min(self.config.summary_fallback_chars, self.config.max_message_chars)
             self._send_to_allowed_chats(
                 f"输出较长，已写入 {self.config.history_path}。检测到底层 CLI 仍有 "
                 "background terminal 正在运行，暂不自动插入摘要请求，避免打断当前任务。"
-                "发送 /history 可获取完整记录；任务结束后可以直接让模型总结。"
+                f"先发送原输出前 {max_chars} 字预览；发送 /history 可获取完整记录；"
+                "任务结束后可以直接让模型总结。"
             )
+            self._send_output_preview(pending, max_chars, structured=structured)
             return self._after_model_output_delivered(allow_auto_continue=False)
         self._send_to_allowed_chats(
             f"输出较长，已写入 {self.config.history_path}。正在请求模型生成 "
@@ -1379,26 +1642,41 @@ class TelegramBridge:
             return
         normalized = command.strip()
         if normalized.startswith("/auto"):
+            self._log_diagnostic("control_command", command=normalized)
             self._handle_auto_continue_command(normalized)
             return
         if normalized == "/all":
+            self._log_diagnostic("control_command", command=normalized)
             self._mode = "all"
             self._send_to_allowed_chats("已切换到完整输出模式。发送 /summary 可切回摘要模式。")
             return
         if normalized == "/summary":
+            self._log_diagnostic("control_command", command=normalized)
             self._mode = "summary"
             self._send_to_allowed_chats("已切换到摘要模式。发送 /all 可查看后续完整输出。")
             return
         if normalized == "/history":
+            self._log_diagnostic("control_command", command=normalized)
             self.send_history(raw=False)
             return
         if normalized == "/rawhistory":
+            self._log_diagnostic("control_command", command=normalized)
             self.send_history(raw=True)
             return
+        if normalized == "/diagnostics":
+            self._log_diagnostic("control_command", command=normalized)
+            self.send_diagnostics()
+            return
+        if normalized == "/status":
+            self._log_diagnostic("control_command", command=normalized)
+            self.send_status()
+            return
         if normalized == "/help":
+            self._log_diagnostic("control_command", command=normalized)
             self._send_to_allowed_chats(
                 "TeleAgent 控制命令：/ta all、/ta summary、/ta history、"
-                "/ta rawhistory、/ta auto start、/ta auto end、/ta auto 7.5。"
+                "/ta rawhistory、/ta diagnostics、/ta status、/ta auto start、"
+                "/ta auto end、/ta auto 7.5。"
                 "其他 / 开头消息会发送给底层 CLI。"
             )
             return
@@ -1464,6 +1742,17 @@ class TelegramBridge:
         if not path.exists():
             self._send_to_allowed_chats("还没有历史记录文件。")
             return
+        label = "原始" if raw else "清理后"
+        try:
+            source_size_text = _format_bytes(path.stat().st_size)
+        except OSError as exc:
+            self._send_to_allowed_chats(f"历史文件读取失败：{exc}")
+            self._errors.put(str(exc))
+            return
+        self._send_to_allowed_chats(
+            f"收到 /{'rawhistory' if raw else 'history'}，正在准备{label}历史文件："
+            f"{path.name} ({source_size_text})。"
+        )
         try:
             send_path = path if raw else _write_clean_history_copy(path)
             size_text = _format_bytes(send_path.stat().st_size)
@@ -1472,7 +1761,7 @@ class TelegramBridge:
             self._errors.put(str(exc))
             return
         self._send_to_allowed_chats(
-            f"正在发送{'原始' if raw else '清理后'}历史文件：{send_path.name} ({size_text})。"
+            f"正在发送{label}历史文件：{send_path.name} ({size_text})。"
         )
         for chat_id in self.config.allowed_chat_ids:
             try:
@@ -1480,7 +1769,61 @@ class TelegramBridge:
                 self._client.send_document(chat_id, send_path, caption=caption)
             except (RuntimeError, urllib.error.URLError, OSError) as exc:
                 self._send_to_allowed_chats(f"历史文件发送失败：{exc}")
+                preview = _read_history_failure_preview(send_path)
+                if preview:
+                    self._send_to_allowed_chats(
+                        "历史文件发送失败，先发送文件开头预览：\n" + preview
+                    )
                 self._errors.put(str(exc))
+
+    def send_diagnostics(self) -> None:
+        if not self.enabled or self._client is None:
+            return
+        if not self.config.diagnostic_log_path:
+            self._send_to_allowed_chats("诊断日志已关闭。")
+            return
+        path = Path(os.path.expandvars(self.config.diagnostic_log_path)).expanduser()
+        if not path.exists():
+            self._send_to_allowed_chats("还没有诊断日志文件。")
+            return
+        self._log_diagnostic("diagnostics_requested")
+        try:
+            size_text = _format_bytes(path.stat().st_size)
+        except OSError as exc:
+            self._send_to_allowed_chats(f"诊断日志读取失败：{exc}")
+            self._errors.put(str(exc))
+            return
+        self._send_to_allowed_chats(
+            f"正在发送诊断日志：{path.name} ({size_text})，"
+            f"默认仅保留最近 {self.config.diagnostic_retention_days:g} 天。"
+        )
+        for chat_id in self.config.allowed_chat_ids:
+            try:
+                self._client.send_document(chat_id, path, caption="TeleAgent diagnostics")
+            except (RuntimeError, urllib.error.URLError, OSError) as exc:
+                self._send_to_allowed_chats(f"诊断日志发送失败：{exc}")
+                self._errors.put(str(exc))
+
+    def send_status(self) -> None:
+        if not self.enabled:
+            return
+        state = self._diagnostic_state()
+        background_age = state.get("background_terminal_age_seconds")
+        if isinstance(background_age, int | float):
+            background_text = _format_duration(float(background_age))
+        else:
+            background_text = "none"
+        self._send_to_allowed_chats(
+            "TeleAgent 状态：\n"
+            f"- mode: {state['mode']}\n"
+            f"- awaiting_summary: {state['awaiting_summary']}\n"
+            f"- auto_continue: {state['auto_continue_enabled']}\n"
+            f"- pending_auto_continue: {state['pending_auto_continue']}\n"
+            f"- pending_raw_len: {state['pending_raw_len']}\n"
+            f"- background_terminal_age: {background_text}\n"
+            f"- background_terminal_stale: {state['background_terminal_stale']}\n"
+            f"- diagnostics_retention_days: {self.config.diagnostic_retention_days:g}"
+        )
 
     def pop_errors(self) -> list[str]:
         errors: list[str] = []
@@ -1652,6 +1995,108 @@ def _format_bytes(size: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{size} B"
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _diagnostic_utc_timestamp(epoch: float | None = None) -> str:
+    if epoch is None:
+        epoch = time.time()
+    return (
+        datetime.fromtimestamp(epoch, timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _diagnostic_text_fields(prefix: str, text: str, max_chars: int) -> dict[str, object]:
+    if max_chars <= 0:
+        snippet = ""
+    else:
+        snippet = text[:max_chars]
+    return {
+        f"{prefix}_len": len(text),
+        f"{prefix}_sha1": hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest(),
+        f"{prefix}_snippet": snippet,
+        f"{prefix}_truncated": len(text) > len(snippet),
+    }
+
+
+def _diagnostic_json_value(value: object) -> object:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {str(key): _diagnostic_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_diagnostic_json_value(item) for item in value]
+    return repr(value)
+
+
+def _diagnostic_record_epoch(record: dict[str, object]) -> float | None:
+    timestamp = record.get("ts")
+    if isinstance(timestamp, str) and timestamp:
+        try:
+            return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _prune_diagnostic_log(
+    path: Path,
+    *,
+    retention_days: float,
+    now_epoch: float,
+) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    cutoff = now_epoch - retention_days * 86400.0
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    kept: list[str] = []
+    dropped = 0
+    for line in lines:
+        if not line.strip():
+            dropped += 1
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            dropped += 1
+            continue
+        if not isinstance(record, dict):
+            dropped += 1
+            continue
+        epoch = _diagnostic_record_epoch(record)
+        if epoch is None or epoch < cutoff:
+            dropped += 1
+            continue
+        kept.append(line)
+
+    if dropped == 0:
+        return None
+    path.write_text(("\n".join(kept) + "\n") if kept else "", encoding="utf-8")
+    return {
+        "retention_days": retention_days,
+        "dropped_lines": dropped,
+        "kept_lines": len(kept),
+    }
 
 
 def _normalize_output_source_name(name: str) -> str:
@@ -2513,7 +2958,7 @@ def parse_telegram_input(text: str) -> TelegramInput:
     ta_command = _parse_teleagent_command(stripped)
     if ta_command is not None:
         return TelegramInput(TelegramInputKind.COMMAND, ta_command)
-    if stripped in ("/all", "/summary", "/history", "/rawhistory"):
+    if stripped in ("/all", "/summary", "/history", "/rawhistory", "/diagnostics", "/status"):
         return TelegramInput(TelegramInputKind.COMMAND, stripped)
     if stripped in ("/enter", "/submit"):
         return TelegramInput(TelegramInputKind.ENTER)
@@ -2555,6 +3000,9 @@ def _parse_teleagent_command(stripped: str) -> str | None:
         "history": "/history",
         "rawhistory": "/rawhistory",
         "raw": "/rawhistory",
+        "diagnostics": "/diagnostics",
+        "diag": "/diagnostics",
+        "status": "/status",
         "help": "/help",
     }
     return aliases.get(command)
@@ -2611,10 +3059,83 @@ def _append_history_entry(path: Path, text: str) -> None:
 
 
 def _write_clean_history_copy(path: Path) -> Path:
-    cleaned = _format_for_mobile(path.read_text(encoding="utf-8", errors="replace"))
     clean_path = path.with_name(f"{path.stem}.clean{path.suffix}")
+    if path.stat().st_size > _HISTORY_FULL_CLEAN_MAX_BYTES:
+        _write_large_clean_history_copy(path, clean_path)
+        return clean_path
+
+    cleaned = _format_for_mobile(path.read_text(encoding="utf-8", errors="replace"))
     clean_path.write_text((cleaned.rstrip() + "\n") if cleaned else "", encoding="utf-8")
     return clean_path
+
+
+def _write_large_clean_history_copy(path: Path, clean_path: Path) -> None:
+    with path.open("r", encoding="utf-8", errors="replace") as source, clean_path.open(
+        "w",
+        encoding="utf-8",
+    ) as target:
+        target.write(
+            "[TeleAgent] 历史文件较大，已使用快速清理模式生成完整文本副本；"
+            "如需完全原始内容，请在本机查看 raw history。\n\n"
+        )
+        previous_blank = False
+        for line in source:
+            cleaned = _clean_large_history_line(line)
+            if not cleaned.strip():
+                if not previous_blank:
+                    target.write("\n")
+                previous_blank = True
+                continue
+            target.write(cleaned.rstrip() + "\n")
+            previous_blank = False
+
+
+def _clean_large_history_line(line: str) -> str:
+    line = line.rstrip("\r\n")
+    line = _strip_terminal_control_fragments(line)
+    line = _strip_sgr_fragment_noise(line)
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith(("› ", "╭", "╰", "│", "└", "├")):
+        return ""
+    if _is_terminal_ui_line(stripped):
+        return ""
+    if _is_spinner_fragment_line(stripped):
+        return ""
+    if _is_terminal_decoration_fragment_line(stripped):
+        return ""
+    if (
+        "请把你刚才过长的回复总结成" in stripped
+        and "面向手机聊天阅读" in stripped
+    ):
+        return ""
+    cleaned = _strip_line_edge_noise(line)
+    cleaned = _strip_inline_terminal_ui_noise(cleaned)
+    cleaned = _strip_sgr_fragment_noise(cleaned)
+    stripped = cleaned.strip()
+    if not stripped:
+        return ""
+    if _is_terminal_ui_line(stripped):
+        return ""
+    if _is_spinner_fragment_line(stripped):
+        return ""
+    if _is_terminal_decoration_fragment_line(stripped):
+        return ""
+    return cleaned
+
+
+def _read_history_failure_preview(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(_HISTORY_FAILURE_PREVIEW_BYTES)
+    except OSError:
+        return ""
+    text = data.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    formatted = _format_for_mobile(text)
+    return _truncate(formatted, 1200)
 
 
 def _pending_raw_limit(config: TelegramConfig) -> int:

@@ -13,6 +13,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+import teleagent.telegram as telegram_module
 from teleagent.telegram import (
     SelectionMenu,
     TelegramBridge,
@@ -29,6 +30,7 @@ from teleagent.telegram import (
     _terminal_chunk_has_pending_signal,
     _terminal_raw_has_active_status,
     _terminal_snapshot_text,
+    _write_clean_history_copy,
     parse_telegram_input,
 )
 from teleagent.__main__ import _resolve_config_path, _resolve_config_path_with_status
@@ -292,8 +294,12 @@ debug_mode = true
         self.assertIn("telegram.output_sources: ['terminal']", result.stdout)
         self.assertIn("telegram.codex_state_root: ~/.codex", result.stdout)
         self.assertIn("telegram.kimi_state_root: ~/.kimi", result.stdout)
+        self.assertIn("telegram.diagnostic_log_path: teleagent-diagnostics.jsonl", result.stdout)
+        self.assertIn("telegram.diagnostic_retention_days: 7.0", result.stdout)
+        self.assertIn("telegram.diagnostic_snippet_chars: 240", result.stdout)
         self.assertIn("telegram.summary_timeout_seconds: 30.0", result.stdout)
         self.assertIn("telegram.summary_fallback_chars: 3500", result.stdout)
+        self.assertIn("telegram.background_terminal_timeout_seconds: 600.0", result.stdout)
         self.assertIn("telegram.slash_submit_delay_seconds: 0.2", result.stdout)
         self.assertIn("telegram.slash_submit_keys: ['enter']", result.stdout)
         self.assertIn("effective_command:", result.stdout)
@@ -561,6 +567,9 @@ allowed_chat_ids = [123]
 forward_patterns = ["Final answer:\\\\s*(.*)"]
 history_path = "tmp-history.log"
 raw_history_path = "tmp-raw.log"
+diagnostic_log_path = "tmp-diagnostics.jsonl"
+diagnostic_retention_days = 7.0
+diagnostic_snippet_chars = 120
 output_mode = "all"
 input_submit_delay_seconds = 0.0
 input_submit_keys = ["enter", "linefeed"]
@@ -568,6 +577,7 @@ slash_submit_delay_seconds = 0.15
 slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.1
 summary_submit_keys = ["linefeed"]
+background_terminal_timeout_seconds = 12.5
 """
             )
             handle.flush()
@@ -582,6 +592,9 @@ summary_submit_keys = ["linefeed"]
         self.assertEqual(len(config.telegram.forward_patterns), 1)
         self.assertEqual(config.telegram.history_path, "tmp-history.log")
         self.assertEqual(config.telegram.raw_history_path, "tmp-raw.log")
+        self.assertEqual(config.telegram.diagnostic_log_path, "tmp-diagnostics.jsonl")
+        self.assertEqual(config.telegram.diagnostic_retention_days, 7.0)
+        self.assertEqual(config.telegram.diagnostic_snippet_chars, 120)
         self.assertEqual(config.telegram.output_mode, "all")
         self.assertEqual(config.telegram.output_sources, ("terminal",))
         self.assertEqual(config.telegram.codex_state_root, "~/.codex")
@@ -594,6 +607,7 @@ summary_submit_keys = ["linefeed"]
         self.assertEqual(config.telegram.summary_submit_keys, ("linefeed",))
         self.assertEqual(config.telegram.summary_timeout_seconds, 30.0)
         self.assertEqual(config.telegram.summary_fallback_chars, 3500)
+        self.assertEqual(config.telegram.background_terminal_timeout_seconds, 12.5)
 
     def test_output_source_aliases_include_kimi_modes(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as handle:
@@ -1090,6 +1104,18 @@ class TelegramInputTest(unittest.TestCase):
 
         self.assertEqual(action.kind, TelegramInputKind.COMMAND)
         self.assertEqual(action.text, "/history")
+
+    def test_ta_prefixed_diagnostics_command(self) -> None:
+        action = parse_telegram_input("/ta diagnostics")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/diagnostics")
+
+    def test_ta_prefixed_status_command(self) -> None:
+        action = parse_telegram_input("/ta status")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/status")
 
     def test_ta_auto_start_command(self) -> None:
         action = parse_telegram_input("/ta auto start")
@@ -2605,8 +2631,9 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             records = _read_debug_records(outbox)
 
             messages = [record["text"] for record in records if record["type"] == "message"]
-            self.assertEqual(len(messages), 1)
-            self.assertIn("正在发送清理后历史文件", messages[0])
+            self.assertEqual(len(messages), 2)
+            self.assertIn("收到 /history", messages[0])
+            self.assertIn("正在发送清理后历史文件", messages[1])
             documents = [record for record in records if record["type"] == "document"]
             self.assertEqual(len(documents), 1)
             clean_path = Path(str(documents[0]["path"]))
@@ -2655,6 +2682,129 @@ class TelegramDebugBridgeTest(unittest.TestCase):
 
         self.assertTrue(any("正在发送清理后历史文件" in message for message in client.messages))
         self.assertTrue(any("历史文件发送失败" in message for message in client.messages))
+        self.assertTrue(any("文件开头预览" in message for message in client.messages))
+
+    def test_large_history_uses_fast_clean_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            history = Path(tmp) / "teleagent-history.log"
+            history.write_text(
+                (
+                    "一句话结论：保留这句。\n"
+                    "› Use /skills to list available skills\n"
+                    "• Working (1m 02s) · 1 background terminal running · /ps to view · /stop to close\n"
+                )
+                * 5,
+                encoding="utf-8",
+            )
+            old_limit = telegram_module._HISTORY_FULL_CLEAN_MAX_BYTES
+            telegram_module._HISTORY_FULL_CLEAN_MAX_BYTES = 10
+            try:
+                clean_path = _write_clean_history_copy(history)
+            finally:
+                telegram_module._HISTORY_FULL_CLEAN_MAX_BYTES = old_limit
+
+            clean_text = clean_path.read_text(encoding="utf-8")
+
+        self.assertIn("快速清理模式", clean_text)
+        self.assertIn("一句话结论：保留这句。", clean_text)
+        self.assertNotIn("Use /skills", clean_text)
+        self.assertNotIn("background terminal running", clean_text)
+
+    def test_diagnostic_log_records_bounded_snippets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            diagnostics = Path(tmp) / "diagnostics.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(Path(tmp) / "outbox.jsonl"),
+                    diagnostic_log_path=str(diagnostics),
+                    diagnostic_snippet_chars=8,
+                )
+            )
+            try:
+                bridge.log_input_action(
+                    TelegramInput(TelegramInputKind.SEND, "x" * 100),
+                    target="cli",
+                )
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(diagnostics)
+
+        input_records = [record for record in records if record.get("event") == "input_action"]
+        self.assertEqual(len(input_records), 1)
+        self.assertEqual(input_records[0]["text_len"], 100)
+        self.assertEqual(input_records[0]["text_snippet"], "x" * 8)
+        self.assertTrue(input_records[0]["text_truncated"])
+        self.assertIn("text_sha1", input_records[0])
+
+    def test_diagnostic_log_prunes_records_older_than_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            diagnostics = Path(tmp) / "diagnostics.jsonl"
+            old_ts = datetime.fromtimestamp(
+                time.time() - 8 * 86400,
+                timezone.utc,
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            recent_ts = datetime.fromtimestamp(
+                time.time() - 3600,
+                timezone.utc,
+            ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            diagnostics.write_text(
+                json.dumps({"ts": old_ts, "event": "old"}, ensure_ascii=False)
+                + "\n"
+                + json.dumps({"ts": recent_ts, "event": "recent"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(Path(tmp) / "outbox.jsonl"),
+                    diagnostic_log_path=str(diagnostics),
+                    diagnostic_retention_days=7,
+                )
+            )
+            bridge.close()
+
+            records = _read_debug_records(diagnostics)
+
+        events = [record.get("event") for record in records]
+        self.assertNotIn("old", events)
+        self.assertIn("recent", events)
+        self.assertIn("diagnostic_pruned", events)
+
+    def test_diagnostics_command_sends_diagnostic_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            diagnostics = Path(tmp) / "diagnostics.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    diagnostic_log_path=str(diagnostics),
+                )
+            )
+            try:
+                bridge.handle_command("/diagnostics")
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertTrue(any("正在发送诊断日志" in str(message) for message in messages))
+        documents = [record for record in records if record["type"] == "document"]
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(Path(str(documents[0]["path"])), diagnostics)
 
     def test_menu_choice_consumes_numeric_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4009,6 +4159,50 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         messages = [str(record["text"]) for record in records if record["type"] == "message"]
         self.assertIn("一句话结论：当前 sweep 还在跑。", messages[-1])
 
+    def test_stale_background_terminal_sends_diagnostic_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            diagnostics = Path(tmp) / "diagnostics.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    diagnostic_log_path=str(diagnostics),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                    background_terminal_timeout_seconds=1,
+                )
+            )
+            try:
+                bridge.handle_command("/auto start")
+                bridge.record_output(
+                    "一句话结论：当前 sweep 还在跑。"
+                    "\n• Working (1m 02s • esc to interrupt) · "
+                    "1 background terminal running · /ps to view · /stop to close"
+                )
+                first_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_seen_at = time.monotonic() - 5
+                second_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+            diagnostic_records = _read_debug_records(diagnostics)
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNone(second_prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertTrue(any("background terminal 持续" in message for message in messages))
+        self.assertIn(
+            "background_terminal_stale",
+            [record.get("event") for record in diagnostic_records],
+        )
+
     def test_auto_continue_prompts_after_background_terminal_is_quiet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = Path(tmp) / "outbox.jsonl"
@@ -4033,7 +4227,8 @@ class TelegramDebugBridgeTest(unittest.TestCase):
                     "1 background terminal running · /ps to view · /stop to close"
                 )
                 first_prompt = bridge.flush_idle_output()
-                bridge._terminal_busy_until = time.monotonic() - 1
+                bridge.record_output("› Use /skills to list available skills")
+                ready_flush = bridge.flush_idle_output()
                 second_prompt = bridge.flush_idle_output()
             finally:
                 bridge.close()
@@ -4041,6 +4236,7 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             records = _read_debug_records(outbox)
 
         self.assertIsNone(first_prompt)
+        self.assertIsNone(ready_flush)
         self.assertEqual(second_prompt, "请继续推进，并且在合适的时候记录进展在 log 里")
         messages = [str(record["text"]) for record in records if record["type"] == "message"]
         self.assertIn("一句话结论：当前 sweep 还在跑。", messages[-1])
@@ -4104,7 +4300,6 @@ class TelegramDebugBridgeTest(unittest.TestCase):
                     + "1 background terminal running · /ps to view · /stop to close"
                 )
                 prompt = bridge.flush_idle_output()
-                bridge._terminal_busy_until = time.monotonic() - 1
                 delayed_prompt = bridge.flush_idle_output()
             finally:
                 bridge.close()
@@ -4112,16 +4307,17 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             records = _read_debug_records(outbox)
 
         self.assertIsNone(prompt)
-        self.assertEqual(delayed_prompt, "请继续推进，并且在合适的时候记录进展在 log 里")
+        self.assertIsNone(delayed_prompt)
         self.assertTrue(
             _terminal_raw_has_active_status(
                 "1 background terminal running · /ps to view · /stop to close"
             )
         )
         messages = [str(record["text"]) for record in records if record["type"] == "message"]
-        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(messages), 3)
         self.assertIn("已开启自动推进模式", messages[0])
         self.assertIn("暂不自动插入摘要请求", messages[1])
+        self.assertIn("一句话结论：当前任务仍在跑", messages[2])
 
     def test_long_output_without_auto_summary_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

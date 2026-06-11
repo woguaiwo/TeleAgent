@@ -21,6 +21,7 @@ env/
 teleagent-history.log
 teleagent-raw.log
 teleagent-events.log
+teleagent-diagnostics.jsonl
 teleagent-debug-inbox.txt
 teleagent-debug-outbox.jsonl
 teleagent-debug-runs/

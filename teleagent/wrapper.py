@@ -200,15 +200,21 @@ def run_wrapped(
                             action = menu_action
                     _log_event(config, f"telegram -> cli: {_describe_telegram_input(action)}")
                     if action.kind == TelegramInputKind.COMMAND:
+                        telegram.log_input_action(action, target="teleagent")
                         telegram.handle_command(action.text)
                         continue
                     if action.kind in (TelegramInputKind.SEND, TelegramInputKind.TYPE):
                         telegram.mark_user_input(action.text)
+                    telegram.log_input_action(action, target="cli")
                     _write_telegram_input(master_fd, action, config.telegram)
             injected_prompt = telegram.flush_idle_output()
             if injected_prompt:
                 telegram.mark_injected_prompt(injected_prompt)
                 _log_event(config, f"injected -> cli: {_describe_injected_prompt(injected_prompt)}")
+                telegram.log_input_action(
+                    TelegramInput(TelegramInputKind.SEND, injected_prompt),
+                    target="cli_injected",
+                )
                 _submit_injected_prompt(master_fd, injected_prompt, config.telegram)
     finally:
         telegram.close()
