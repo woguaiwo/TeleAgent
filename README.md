@@ -97,6 +97,8 @@ Set `settings.default_command` in `teleagent.toml` to run `teleagent` directly:
 buffer_size = 8192
 log_matches = true
 event_log_path = "teleagent-events.log"
+local_cursor_mode = "auto_hide"
+local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 ```
 
@@ -153,6 +155,8 @@ into it. The default project-local token path is `.teleagent/telegram-token`.
 
 ```toml
 [settings]
+local_cursor_mode = "auto_hide"
+local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 
 [telegram]
@@ -186,6 +190,7 @@ summary_max_chars = 800
 auto_summary = true
 summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
+summary_background_wait_seconds = 45.0
 background_terminal_timeout_seconds = 600.0
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
@@ -288,6 +293,10 @@ TeleAgent now supports both full output and summary output:
   is longer than `summary_threshold_chars`, TeleAgent sends a notice and injects
   `summary_prompt_template` into the wrapped CLI so the model can produce a
   compact summary.
+- If long terminal output appears while the CLI reports a background terminal,
+  TeleAgent waits up to `summary_background_wait_seconds` before deciding. If
+  the background status clears during that window, it requests a model summary;
+  otherwise it sends a truncated preview and does not inject a summary request.
 - `summary_submit_keys` controls how the injected summary prompt is submitted.
   The default sends Enter and then linefeed because some terminal UIs accept one
   but not the other when input is injected programmatically.
@@ -367,8 +376,17 @@ Settings:
 buffer_size = 8192
 log_matches = true
 event_log_path = "teleagent-events.log"
+local_cursor_mode = "auto_hide"
+local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 ```
+
+`local_cursor_mode = "auto_hide"` hides the local terminal cursor while the
+wrapped CLI is actively redrawing output, then restores it after a short idle
+period or when local keyboard input arrives. This reduces visible cursor jumps
+from full-screen CLIs. Use `"passthrough"` to keep the wrapped CLI's original
+cursor behavior, or `"hidden"` to keep the local cursor hidden until TeleAgent
+exits.
 
 Telegram is configured under `[telegram]` and is disabled by default in the
 public template.

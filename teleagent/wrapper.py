@@ -59,6 +59,8 @@ class WrapperConfig:
     buffer_size: int = 8192
     log_matches: bool = True
     event_log_path: str = "teleagent-events.log"
+    local_cursor_mode: str = "auto_hide"
+    local_cursor_idle_seconds: float = 0.75
     default_command: tuple[str, ...] = ()
     telegram: TelegramConfig = TelegramConfig()
 
@@ -88,6 +90,8 @@ class WrapperConfig:
         buffer_size = settings.get("buffer_size", 8192)
         log_matches = settings.get("log_matches", True)
         event_log_path = settings.get("event_log_path", "teleagent-events.log")
+        local_cursor_mode = settings.get("local_cursor_mode", "auto_hide")
+        local_cursor_idle_seconds = settings.get("local_cursor_idle_seconds", 0.75)
         default_command_raw = settings.get("default_command", [])
         if not isinstance(buffer_size, int) or buffer_size < 256:
             raise ValueError("settings.buffer_size must be an integer >= 256")
@@ -95,6 +99,18 @@ class WrapperConfig:
             raise ValueError("settings.log_matches must be a boolean")
         if not isinstance(event_log_path, str):
             raise ValueError("settings.event_log_path must be a string")
+        if (
+            not isinstance(local_cursor_mode, str)
+            or local_cursor_mode not in {"auto_hide", "hidden", "passthrough"}
+        ):
+            raise ValueError(
+                'settings.local_cursor_mode must be "auto_hide", "hidden", or "passthrough"'
+            )
+        if (
+            not isinstance(local_cursor_idle_seconds, int | float)
+            or local_cursor_idle_seconds < 0
+        ):
+            raise ValueError("settings.local_cursor_idle_seconds must be a number >= 0")
         if not isinstance(default_command_raw, list) or not all(
             isinstance(item, str) and item for item in default_command_raw
         ):
@@ -109,6 +125,8 @@ class WrapperConfig:
             buffer_size=buffer_size,
             log_matches=log_matches,
             event_log_path=event_log_path,
+            local_cursor_mode=local_cursor_mode,
+            local_cursor_idle_seconds=float(local_cursor_idle_seconds),
             default_command=tuple(default_command_raw),
             telegram=TelegramConfig.from_dict(telegram_raw),
         )
@@ -139,8 +157,15 @@ def run_wrapped(
     used_once: set[str] = set()
     output_buffer = ""
     config = _config_for_command(config, command)
+    local_cursor = _LocalCursorController(
+        sys.stdout.fileno(),
+        mode=config.local_cursor_mode,
+        idle_seconds=config.local_cursor_idle_seconds,
+        enabled=sys.stdout.isatty(),
+    )
     telegram = TelegramBridge(config.telegram)
     local_input_tracker = _LocalInputTracker()
+    local_cursor.start()
     telegram.start()
     if telegram.enabled:
         mode = "debug" if config.telegram.debug_mode else "telegram"
@@ -167,7 +192,9 @@ def run_wrapped(
                 if not chunk:
                     break
 
+                local_cursor.on_child_output()
                 os.write(sys.stdout.fileno(), chunk)
+                local_cursor.on_child_output()
                 decoded_chunk = chunk.decode(errors="ignore")
                 telegram.record_output(decoded_chunk)
                 output_buffer = (output_buffer + decoded_chunk)[
@@ -188,6 +215,7 @@ def run_wrapped(
                 user_input = os.read(sys.stdin.fileno(), 4096)
                 if not user_input:
                     break
+                local_cursor.on_local_input()
                 for completed_input in local_input_tracker.feed(user_input):
                     telegram.mark_user_input(completed_input)
                 os.write(master_fd, user_input)
@@ -216,8 +244,10 @@ def run_wrapped(
                     target="cli_injected",
                 )
                 _submit_injected_prompt(master_fd, injected_prompt, config.telegram)
+            local_cursor.on_tick()
     finally:
         telegram.close()
+        local_cursor.close()
         if old_stdin_attrs is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_stdin_attrs)
         signal.signal(signal.SIGWINCH, old_winch)
@@ -315,6 +345,71 @@ class _LocalInputTracker:
         elif len(self._escape_sequence) > 16:
             self._escape_sequence = ""
         return True
+
+
+class _LocalCursorController:
+    _HIDE_CURSOR = b"\x1b[?25l"
+    _SHOW_CURSOR = b"\x1b[?25h"
+
+    def __init__(
+        self,
+        output_fd: int,
+        *,
+        mode: str,
+        idle_seconds: float,
+        enabled: bool,
+    ) -> None:
+        self._output_fd = output_fd
+        self._mode = mode
+        self._idle_seconds = idle_seconds
+        self._enabled = enabled and mode != "passthrough"
+        self._hidden = False
+        self._last_output_at: float | None = None
+
+    def start(self) -> None:
+        if self._enabled and self._mode == "hidden":
+            self._hide()
+
+    def on_child_output(self) -> None:
+        if not self._enabled:
+            return
+        self._last_output_at = time.monotonic()
+        if self._mode in {"auto_hide", "hidden"}:
+            self._hide()
+
+    def on_local_input(self) -> None:
+        if self._enabled and self._mode == "auto_hide":
+            self._show()
+
+    def on_tick(self) -> None:
+        if (
+            self._enabled
+            and self._mode == "auto_hide"
+            and self._hidden
+            and self._last_output_at is not None
+            and time.monotonic() - self._last_output_at >= self._idle_seconds
+        ):
+            self._show()
+
+    def close(self) -> None:
+        if self._enabled:
+            self._show()
+
+    def _hide(self) -> None:
+        self._write(self._HIDE_CURSOR)
+        self._hidden = True
+
+    def _show(self) -> None:
+        if not self._hidden:
+            return
+        self._write(self._SHOW_CURSOR)
+        self._hidden = False
+
+    def _write(self, sequence: bytes) -> None:
+        try:
+            os.write(self._output_fd, sequence)
+        except OSError:
+            return
 
 
 def _maybe_reply(

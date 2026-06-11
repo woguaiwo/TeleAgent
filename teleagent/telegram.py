@@ -105,6 +105,7 @@ class TelegramConfig:
     auto_summary: bool = True
     summary_timeout_seconds: float = 30.0
     summary_fallback_chars: int = 3500
+    summary_background_wait_seconds: float = 45.0
     background_terminal_timeout_seconds: float = 600.0
     input_submit_delay_seconds: float = 0.05
     input_submit_keys: tuple[str, ...] = ("enter", "linefeed")
@@ -186,6 +187,7 @@ class TelegramConfig:
         auto_summary = data.get("auto_summary", True)
         summary_timeout_seconds = data.get("summary_timeout_seconds", 30.0)
         summary_fallback_chars = data.get("summary_fallback_chars", 3500)
+        summary_background_wait_seconds = data.get("summary_background_wait_seconds", 45.0)
         background_terminal_timeout_seconds = data.get(
             "background_terminal_timeout_seconds",
             600.0,
@@ -245,6 +247,11 @@ class TelegramConfig:
             raise ValueError("telegram.summary_timeout_seconds must be a number >= 0")
         if not isinstance(summary_fallback_chars, int) or summary_fallback_chars < 100:
             raise ValueError("telegram.summary_fallback_chars must be an integer >= 100")
+        if (
+            not isinstance(summary_background_wait_seconds, int | float)
+            or summary_background_wait_seconds < 0
+        ):
+            raise ValueError("telegram.summary_background_wait_seconds must be a number >= 0")
         if (
             not isinstance(background_terminal_timeout_seconds, int | float)
             or background_terminal_timeout_seconds < 0
@@ -307,6 +314,7 @@ class TelegramConfig:
             auto_summary=auto_summary,
             summary_timeout_seconds=float(summary_timeout_seconds),
             summary_fallback_chars=summary_fallback_chars,
+            summary_background_wait_seconds=float(summary_background_wait_seconds),
             background_terminal_timeout_seconds=float(background_terminal_timeout_seconds),
             input_submit_delay_seconds=float(input_submit_delay_seconds),
             input_submit_keys=tuple(input_submit_keys),
@@ -913,6 +921,8 @@ class TelegramBridge:
         self._summary_requested_at: float | None = None
         self._summary_fallback_output = ""
         self._summary_fallback_structured = False
+        self._background_summary_output = ""
+        self._background_summary_started_at: float | None = None
         self._injected_prompts: list[str] = []
         self._recent_user_inputs: list[str] = []
         self._pending_menu: SelectionMenu | None = None
@@ -1029,9 +1039,16 @@ class TelegramBridge:
             if self._background_terminal_seen_at is not None
             else None
         )
+        background_summary_age = (
+            round(now - self._background_summary_started_at, 3)
+            if self._background_summary_started_at is not None
+            else None
+        )
         return {
             "mode": self._mode,
             "awaiting_summary": self._awaiting_summary,
+            "background_summary_pending": bool(self._background_summary_output),
+            "background_summary_age_seconds": background_summary_age,
             "pending_raw_len": len(self._pending_raw_output),
             "restore_redraw_active": self._restore_redraw_active,
             "auto_continue_enabled": self._auto_continue_enabled,
@@ -1236,6 +1253,9 @@ class TelegramBridge:
         self._maybe_finish_restore_redraw_guard()
         if self._background_terminal_is_stale():
             self._notify_background_terminal_stale_once()
+        deferred_summary_prompt = self._flush_background_summary_wait()
+        if deferred_summary_prompt:
+            return deferred_summary_prompt
         auto_prompt = self._pop_auto_continue_prompt_if_ready()
         if auto_prompt:
             self._log_diagnostic(
@@ -1361,6 +1381,7 @@ class TelegramBridge:
         self._restore_redraw_active = True
         self._restore_redraw_ready_seen = False
         self._clear_pending_summary()
+        self._clear_background_summary_wait()
         self._pending_auto_continue_prompt = None
 
     def _end_restore_redraw_guard(self) -> None:
@@ -1426,7 +1447,7 @@ class TelegramBridge:
             return None
         if self._restore_redraw_active:
             return None
-        if self._awaiting_summary or self._pending_raw_output:
+        if self._awaiting_summary or self._background_summary_output or self._pending_raw_output:
             return None
         if self._background_terminal_seen_at is not None:
             if self._background_terminal_is_stale():
@@ -1521,15 +1542,8 @@ class TelegramBridge:
                 allow_auto_continue=allow_auto_continue,
             )
         if defer_auto_summary and not structured:
-            max_chars = min(self.config.summary_fallback_chars, self.config.max_message_chars)
-            self._send_to_allowed_chats(
-                f"输出较长，已写入 {self.config.history_path}。检测到底层 CLI 仍有 "
-                "background terminal 正在运行，暂不自动插入摘要请求，避免打断当前任务。"
-                f"先发送原输出前 {max_chars} 字预览；发送 /history 可获取完整记录；"
-                "任务结束后可以直接让模型总结。"
-            )
-            self._send_output_preview(pending, max_chars, structured=structured)
-            return self._after_model_output_delivered(allow_auto_continue=False)
+            self._defer_summary_until_background_quiet(pending)
+            return None
         self._send_to_allowed_chats(
             f"输出较长，已写入 {self.config.history_path}。正在请求模型生成 "
             f"{self.config.summary_max_chars} 字以内摘要。若摘要未返回，会自动发送截断预览。"
@@ -1542,6 +1556,120 @@ class TelegramBridge:
         return self.config.summary_prompt_template.format(
             max_chars=self.config.summary_max_chars
         )
+
+    def _defer_summary_until_background_quiet(self, pending: str) -> None:
+        now = time.monotonic()
+        first_pending = not self._background_summary_output
+        if first_pending:
+            self._background_summary_started_at = now
+            self._background_summary_output = pending
+            self._log_diagnostic(
+                "background_summary_deferred",
+                wait_seconds=self.config.summary_background_wait_seconds,
+                **_diagnostic_text_fields(
+                    "pending",
+                    pending,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+        else:
+            merged = self._background_summary_output.rstrip() + "\n\n" + pending.strip()
+            self._background_summary_output = merged[-_pending_raw_limit(self.config) :]
+            self._log_diagnostic(
+                "background_summary_merged",
+                wait_seconds=self.config.summary_background_wait_seconds,
+                **_diagnostic_text_fields(
+                    "pending",
+                    pending,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+
+        if self.config.summary_background_wait_seconds <= 0:
+            self._send_background_summary_timeout_preview(0.0)
+            return
+        if not first_pending:
+            return
+
+        max_chars = min(self.config.summary_fallback_chars, self.config.max_message_chars)
+        self._send_to_allowed_chats(
+            f"输出较长，已写入 {self.config.history_path}。检测到底层 CLI 仍有 "
+            "background terminal 正在运行，准备等待最多 "
+            f"{_format_duration(self.config.summary_background_wait_seconds)}："
+            f"如果期间结束，将请求模型生成 {self.config.summary_max_chars} 字以内摘要；"
+            f"如果仍未结束，将发送原输出前 {max_chars} 字截断预览，不插入摘要请求。"
+            "发送 /history 可获取完整记录。"
+        )
+
+    def _flush_background_summary_wait(self) -> str | None:
+        if not self._background_summary_output:
+            return None
+        if self._restore_redraw_active or self._pending_raw_output:
+            return None
+        now = time.monotonic()
+        started_at = self._background_summary_started_at or now
+        elapsed = now - started_at
+        if self._background_terminal_seen_at is None:
+            return self._request_background_summary_after_wait(elapsed)
+        wait_seconds = self.config.summary_background_wait_seconds
+        if wait_seconds <= 0 or elapsed >= wait_seconds:
+            self._send_background_summary_timeout_preview(elapsed)
+        return None
+
+    def _request_background_summary_after_wait(self, elapsed_seconds: float) -> str | None:
+        pending = self._background_summary_output.strip()
+        self._clear_background_summary_wait()
+        if not pending:
+            return None
+        self._log_diagnostic(
+            "background_summary_request",
+            elapsed_seconds=round(elapsed_seconds, 3),
+            **_diagnostic_text_fields(
+                "pending",
+                pending,
+                self.config.diagnostic_snippet_chars,
+            ),
+        )
+        self._send_to_allowed_chats(
+            "background terminal 已结束，准备请求模型生成 "
+            f"{self.config.summary_max_chars} 字以内摘要。若摘要未返回，会自动发送截断预览。"
+            "发送 /history 可获取完整记录。"
+        )
+        self._awaiting_summary = True
+        self._summary_requested_at = time.monotonic()
+        self._summary_fallback_output = pending
+        self._summary_fallback_structured = False
+        return self.config.summary_prompt_template.format(
+            max_chars=self.config.summary_max_chars
+        )
+
+    def _send_background_summary_timeout_preview(self, elapsed_seconds: float) -> None:
+        pending = self._background_summary_output.strip()
+        self._clear_background_summary_wait()
+        if not pending:
+            return
+        max_chars = min(self.config.summary_fallback_chars, self.config.max_message_chars)
+        self._log_diagnostic(
+            "background_summary_timeout_preview",
+            elapsed_seconds=round(elapsed_seconds, 3),
+            wait_seconds=self.config.summary_background_wait_seconds,
+            **_diagnostic_text_fields(
+                "pending",
+                pending,
+                self.config.diagnostic_snippet_chars,
+            ),
+        )
+        self._send_to_allowed_chats(
+            "background terminal 在 "
+            f"{_format_duration(elapsed_seconds)} 内未结束，准备发送截断预览；"
+            "为避免打断正在运行的任务，本次不插入摘要请求。"
+            f"完整记录已写入 {self.config.history_path}，发送 /history 可获取。"
+        )
+        self._send_output_preview(pending, max_chars, structured=False)
+
+    def _clear_background_summary_wait(self) -> None:
+        self._background_summary_output = ""
+        self._background_summary_started_at = None
 
     def _clear_pending_summary(self) -> None:
         self._awaiting_summary = False
@@ -1609,6 +1737,7 @@ class TelegramBridge:
         text = text.strip()
         if text:
             self._clear_pending_summary()
+            self._clear_background_summary_wait()
             self._pending_auto_continue_prompt = None
             if _is_restore_redraw_command(text):
                 self._begin_restore_redraw_guard()
@@ -1826,10 +1955,17 @@ class TelegramBridge:
             background_text = _format_duration(float(background_age))
         else:
             background_text = "none"
+        background_summary_age = state.get("background_summary_age_seconds")
+        if isinstance(background_summary_age, int | float):
+            background_summary_text = _format_duration(float(background_summary_age))
+        else:
+            background_summary_text = "none"
         self._send_to_allowed_chats(
             "TeleAgent 状态：\n"
             f"- mode: {state['mode']}\n"
             f"- awaiting_summary: {state['awaiting_summary']}\n"
+            f"- background_summary_pending: {state['background_summary_pending']}\n"
+            f"- background_summary_age: {background_summary_text}\n"
             f"- auto_continue: {state['auto_continue_enabled']}\n"
             f"- pending_auto_continue: {state['pending_auto_continue']}\n"
             f"- pending_raw_len: {state['pending_raw_len']}\n"

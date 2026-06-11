@@ -36,6 +36,7 @@ from teleagent.telegram import (
 from teleagent.__main__ import _resolve_config_path, _resolve_config_path_with_status
 from teleagent.wrapper import (
     WrapperConfig,
+    _LocalCursorController,
     _LocalInputTracker,
     _config_for_command,
     _write_telegram_input,
@@ -365,6 +366,7 @@ debug_mode = true
         self.assertIn("telegram.diagnostic_snippet_chars: 240", result.stdout)
         self.assertIn("telegram.summary_timeout_seconds: 30.0", result.stdout)
         self.assertIn("telegram.summary_fallback_chars: 3500", result.stdout)
+        self.assertIn("telegram.summary_background_wait_seconds: 45.0", result.stdout)
         self.assertIn("telegram.background_terminal_timeout_seconds: 600.0", result.stdout)
         self.assertIn("telegram.slash_submit_delay_seconds: 0.2", result.stdout)
         self.assertIn("telegram.slash_submit_keys: ['enter']", result.stdout)
@@ -380,6 +382,8 @@ debug_mode = true
 [settings]
 default_command = ["codex"]
 event_log_path = "custom-events.log"
+local_cursor_mode = "hidden"
+local_cursor_idle_seconds = 1.25
 
 [telegram]
 enabled = true
@@ -625,6 +629,8 @@ class ConfigTest(unittest.TestCase):
 [settings]
 default_command = ["codex"]
 event_log_path = "custom-events.log"
+local_cursor_mode = "hidden"
+local_cursor_idle_seconds = 1.25
 
 [telegram]
 enabled = true
@@ -643,6 +649,7 @@ slash_submit_delay_seconds = 0.15
 slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.1
 summary_submit_keys = ["linefeed"]
+summary_background_wait_seconds = 12.0
 background_terminal_timeout_seconds = 12.5
 """
             )
@@ -653,6 +660,8 @@ background_terminal_timeout_seconds = 12.5
         self.assertTrue(config.telegram.enabled)
         self.assertEqual(config.default_command, ("codex",))
         self.assertEqual(config.event_log_path, "custom-events.log")
+        self.assertEqual(config.local_cursor_mode, "hidden")
+        self.assertEqual(config.local_cursor_idle_seconds, 1.25)
         self.assertEqual(config.telegram.resolved_token(), "fake-token")
         self.assertEqual(config.telegram.allowed_chat_ids, (123,))
         self.assertEqual(len(config.telegram.forward_patterns), 1)
@@ -673,7 +682,79 @@ background_terminal_timeout_seconds = 12.5
         self.assertEqual(config.telegram.summary_submit_keys, ("linefeed",))
         self.assertEqual(config.telegram.summary_timeout_seconds, 30.0)
         self.assertEqual(config.telegram.summary_fallback_chars, 3500)
+        self.assertEqual(config.telegram.summary_background_wait_seconds, 12.0)
         self.assertEqual(config.telegram.background_terminal_timeout_seconds, 12.5)
+
+    def test_local_cursor_auto_hide_restores_after_idle(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            cursor = _LocalCursorController(
+                write_fd,
+                mode="auto_hide",
+                idle_seconds=0,
+                enabled=True,
+            )
+
+            cursor.on_child_output()
+            cursor.on_tick()
+            cursor.close()
+            os.close(write_fd)
+            write_fd = -1
+            payload = os.read(read_fd, 1024)
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(payload, b"\x1b[?25l\x1b[?25h")
+
+    def test_local_cursor_auto_hide_restores_on_local_input(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            cursor = _LocalCursorController(
+                write_fd,
+                mode="auto_hide",
+                idle_seconds=999,
+                enabled=True,
+            )
+
+            cursor.on_child_output()
+            cursor.on_local_input()
+            cursor.close()
+            os.close(write_fd)
+            write_fd = -1
+            payload = os.read(read_fd, 1024)
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(payload, b"\x1b[?25l\x1b[?25h")
+
+    def test_local_cursor_passthrough_writes_nothing(self) -> None:
+        read_fd, write_fd = os.pipe()
+        try:
+            cursor = _LocalCursorController(
+                write_fd,
+                mode="passthrough",
+                idle_seconds=0,
+                enabled=True,
+            )
+
+            cursor.start()
+            cursor.on_child_output()
+            cursor.on_tick()
+            cursor.on_local_input()
+            cursor.close()
+            os.close(write_fd)
+            write_fd = -1
+            payload = os.read(read_fd, 1024)
+        finally:
+            if write_fd >= 0:
+                os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(payload, b"")
 
     def test_output_source_aliases_include_kimi_modes(self) -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".toml") as handle:
@@ -4386,10 +4467,96 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             )
         )
         messages = [str(record["text"]) for record in records if record["type"] == "message"]
-        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(messages), 2)
         self.assertIn("已开启自动推进模式", messages[0])
-        self.assertIn("暂不自动插入摘要请求", messages[1])
-        self.assertIn("一句话结论：当前任务仍在跑", messages[2])
+        self.assertIn("准备等待最多 45s", messages[1])
+        self.assertIn("如果期间结束，将请求模型生成 800 字以内摘要", messages[1])
+        self.assertIn("如果仍未结束，将发送原输出前", messages[1])
+
+    def test_long_terminal_output_waits_for_background_then_requests_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_timeout_seconds=999,
+                    summary_background_wait_seconds=45,
+                )
+            )
+            try:
+                bridge.record_output(
+                    ("一句话结论：当前任务仍在跑，已经有阶段性结果。" * 12)
+                    + "\n• Working (14m 29s • esc to interrupt) · "
+                    + "1 background terminal running · /ps to view · /stop to close"
+                )
+                first_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_seen_at = None
+                summary_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNotNone(summary_prompt)
+        self.assertIn("总结成", summary_prompt or "")
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 2)
+        self.assertIn("准备等待最多 45s", messages[0])
+        self.assertIn("如果期间结束，将请求模型生成 800 字以内摘要", messages[0])
+        self.assertIn("background terminal 已结束，准备请求模型生成 800 字以内摘要", messages[1])
+
+    def test_long_terminal_output_background_wait_timeout_sends_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_background_wait_seconds=45,
+                    summary_fallback_chars=120,
+                )
+            )
+            try:
+                bridge.record_output(
+                    ("这是很长的原始输出，后台还没有结束。" * 20)
+                    + "\n• Working (14m 29s • esc to interrupt) · "
+                    + "1 background terminal running · /ps to view · /stop to close"
+                )
+                first_prompt = bridge.flush_idle_output()
+                bridge._background_summary_started_at = time.monotonic() - 46
+                second_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNone(second_prompt)
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 3)
+        self.assertIn("准备等待最多 45s", messages[0])
+        self.assertIn("准备发送截断预览", messages[1])
+        self.assertIn("本次不插入摘要请求", messages[1])
+        self.assertIn("这是很长的原始输出", messages[2])
+        self.assertIn("...[truncated]", messages[2])
 
     def test_long_output_without_auto_summary_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
