@@ -1401,6 +1401,18 @@ class TelegramBridge:
             ),
         )
 
+    def _queue_auto_continue_prompt(self, reason: str) -> None:
+        self._pending_auto_continue_prompt = _AUTO_CONTINUE_PROMPT
+        self._log_diagnostic(
+            "auto_continue_queued",
+            reason=reason,
+            **_diagnostic_text_fields(
+                "prompt",
+                _AUTO_CONTINUE_PROMPT,
+                self.config.diagnostic_snippet_chars,
+            ),
+        )
+
     def _pop_auto_continue_prompt(self) -> str | None:
         if not self._auto_continue_is_active():
             self._pending_auto_continue_prompt = None
@@ -1704,9 +1716,10 @@ class TelegramBridge:
         if argument in {"start", "on"}:
             self._auto_continue_enabled = True
             self._auto_continue_until = None
-            self._pending_auto_continue_prompt = None
+            self._queue_auto_continue_prompt("start")
             self._send_to_allowed_chats(
-                f"已开启自动推进模式。模型每次回复后会自动发送：{_AUTO_CONTINUE_PROMPT}。"
+                f"已开启自动推进模式。会先尝试发送一次：{_AUTO_CONTINUE_PROMPT}。"
+                "之后模型每次回复后也会自动发送。"
                 "发送 /ta auto end 可关闭。"
             )
             return
@@ -1728,10 +1741,10 @@ class TelegramBridge:
             return
         self._auto_continue_enabled = True
         self._auto_continue_until = time.monotonic() + hours * 3600
-        self._pending_auto_continue_prompt = None
+        self._queue_auto_continue_prompt("timer_start")
         self._send_to_allowed_chats(
             f"已开启自动推进模式，将在 {hours:g} 小时后自动停止。"
-            f"模型每次回复后会自动发送：{_AUTO_CONTINUE_PROMPT}。"
+            f"会先尝试发送一次：{_AUTO_CONTINUE_PROMPT}。之后模型每次回复后也会自动发送。"
             "发送 /ta auto end 可提前关闭。"
         )
 
@@ -2958,6 +2971,8 @@ def parse_telegram_input(text: str) -> TelegramInput:
     ta_command = _parse_teleagent_command(stripped)
     if ta_command is not None:
         return TelegramInput(TelegramInputKind.COMMAND, ta_command)
+    if stripped == "/auto" or stripped.startswith("/auto "):
+        return TelegramInput(TelegramInputKind.COMMAND, stripped)
     if stripped in ("/all", "/summary", "/history", "/rawhistory", "/diagnostics", "/status"):
         return TelegramInput(TelegramInputKind.COMMAND, stripped)
     if stripped in ("/enter", "/submit"):

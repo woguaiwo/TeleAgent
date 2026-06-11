@@ -179,6 +179,72 @@ summary_submit_keys = ["enter"]
             )
         )
 
+    def test_debug_auto_start_immediately_reaches_idle_wrapped_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            inbox = tmp_path / "inbox.txt"
+            outbox = tmp_path / "outbox.jsonl"
+            event_log = tmp_path / "events.log"
+            config_path = tmp_path / "teleagent.toml"
+            config_path.write_text(
+                f"""
+[settings]
+default_command = []
+event_log_path = "{event_log}"
+
+[telegram]
+enabled = true
+debug_mode = true
+allowed_chat_ids = [0]
+debug_inbox_path = "{inbox}"
+debug_outbox_path = "{outbox}"
+history_path = "{tmp_path / "history.log"}"
+raw_history_path = "{tmp_path / "raw.log"}"
+idle_forward_seconds = 0
+summary_threshold_chars = 1000
+summary_submit_delay_seconds = 0
+summary_submit_keys = ["enter"]
+""",
+                encoding="utf-8",
+            )
+            script = (
+                "import sys\n"
+                "line = sys.stdin.readline().strip()\n"
+                "print('auto=' + line, flush=True)\n"
+            )
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "-c",
+                    str(config_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    script,
+                ],
+                cwd=ROOT,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            time.sleep(0.5)
+            inbox.write_text("/ta auto start\n", encoding="utf-8")
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                self.fail(output)
+
+            event_log_text = event_log.read_text(encoding="utf-8")
+
+        self.assertEqual(process.returncode, 0, output)
+        self.assertIn("auto=请继续推进，并且在合适的时候记录进展在 log 里", output)
+        self.assertIn("injected -> cli: 请继续推进", event_log_text)
+
     def test_default_command_runs_when_no_command_is_given(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "teleagent.toml"
@@ -1119,6 +1185,12 @@ class TelegramInputTest(unittest.TestCase):
 
     def test_ta_auto_start_command(self) -> None:
         action = parse_telegram_input("/ta auto start")
+
+        self.assertEqual(action.kind, TelegramInputKind.COMMAND)
+        self.assertEqual(action.text, "/auto start")
+
+    def test_direct_auto_start_command(self) -> None:
+        action = parse_telegram_input("/auto start")
 
         self.assertEqual(action.kind, TelegramInputKind.COMMAND)
         self.assertEqual(action.text, "/auto start")
