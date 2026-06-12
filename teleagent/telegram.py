@@ -42,6 +42,7 @@ _RECENT_OUTPUT_FINGERPRINT_TTL_SECONDS = 60.0
 _MENU_CHOICE_SUPPRESS_SECONDS = 2.0
 _AUTO_CONTINUE_BUSY_GRACE_SECONDS = 5.0
 _AUTO_CONTINUE_PROMPT = "请继续推进，并且在合适的时候记录进展在 log 里"
+_AUTO_APPROVAL_REPEAT_SUPPRESS_SECONDS = 30.0
 _HISTORY_FULL_CLEAN_MAX_BYTES = 750_000
 _HISTORY_FAILURE_PREVIEW_BYTES = 12_000
 _DIAGNOSTIC_TEXT_DEFAULT_CHARS = 240
@@ -106,6 +107,7 @@ class TelegramConfig:
     summary_timeout_seconds: float = 30.0
     summary_fallback_chars: int = 3500
     summary_background_wait_seconds: float = 45.0
+    summary_background_ready_stable_seconds: float = 15.0
     background_terminal_timeout_seconds: float = 600.0
     input_submit_delay_seconds: float = 0.05
     input_submit_keys: tuple[str, ...] = ("enter", "linefeed")
@@ -188,6 +190,10 @@ class TelegramConfig:
         summary_timeout_seconds = data.get("summary_timeout_seconds", 30.0)
         summary_fallback_chars = data.get("summary_fallback_chars", 3500)
         summary_background_wait_seconds = data.get("summary_background_wait_seconds", 45.0)
+        summary_background_ready_stable_seconds = data.get(
+            "summary_background_ready_stable_seconds",
+            15.0,
+        )
         background_terminal_timeout_seconds = data.get(
             "background_terminal_timeout_seconds",
             600.0,
@@ -253,6 +259,13 @@ class TelegramConfig:
         ):
             raise ValueError("telegram.summary_background_wait_seconds must be a number >= 0")
         if (
+            not isinstance(summary_background_ready_stable_seconds, int | float)
+            or summary_background_ready_stable_seconds < 0
+        ):
+            raise ValueError(
+                "telegram.summary_background_ready_stable_seconds must be a number >= 0"
+            )
+        if (
             not isinstance(background_terminal_timeout_seconds, int | float)
             or background_terminal_timeout_seconds < 0
         ):
@@ -315,6 +328,9 @@ class TelegramConfig:
             summary_timeout_seconds=float(summary_timeout_seconds),
             summary_fallback_chars=summary_fallback_chars,
             summary_background_wait_seconds=float(summary_background_wait_seconds),
+            summary_background_ready_stable_seconds=float(
+                summary_background_ready_stable_seconds
+            ),
             background_terminal_timeout_seconds=float(background_terminal_timeout_seconds),
             input_submit_delay_seconds=float(input_submit_delay_seconds),
             input_submit_keys=tuple(input_submit_keys),
@@ -923,8 +939,10 @@ class TelegramBridge:
         self._summary_fallback_structured = False
         self._background_summary_output = ""
         self._background_summary_started_at: float | None = None
+        self._background_summary_ready_wait_last_log_at = 0.0
         self._injected_prompts: list[str] = []
         self._recent_user_inputs: list[str] = []
+        self._local_input_draft = ""
         self._pending_menu: SelectionMenu | None = None
         self._sent_menu_fingerprint = ""
         self._suppress_menu_until = 0.0
@@ -933,9 +951,12 @@ class TelegramBridge:
         self._auto_continue_enabled = False
         self._auto_continue_until: float | None = None
         self._pending_auto_continue_prompt: str | None = None
+        self._pending_internal_actions: list[TelegramInput] = []
+        self._recent_auto_approval_fingerprints: dict[str, float] = {}
         self._terminal_busy_until = 0.0
         self._background_terminal_seen_at: float | None = None
         self._background_terminal_last_seen_at: float | None = None
+        self._background_terminal_cleared_at: float | None = None
         self._background_terminal_last_log_at = 0.0
         self._background_terminal_stale_notified = False
         self._structured_sources: dict[str, object] = {}
@@ -1044,15 +1065,22 @@ class TelegramBridge:
             if self._background_summary_started_at is not None
             else None
         )
+        background_clear_age = (
+            round(now - self._background_terminal_cleared_at, 3)
+            if self._background_terminal_cleared_at is not None
+            else None
+        )
         return {
             "mode": self._mode,
             "awaiting_summary": self._awaiting_summary,
             "background_summary_pending": bool(self._background_summary_output),
             "background_summary_age_seconds": background_summary_age,
+            "background_terminal_clear_age_seconds": background_clear_age,
             "pending_raw_len": len(self._pending_raw_output),
             "restore_redraw_active": self._restore_redraw_active,
             "auto_continue_enabled": self._auto_continue_enabled,
             "pending_auto_continue": bool(self._pending_auto_continue_prompt),
+            "local_input_draft": bool(self._local_input_draft),
             "terminal_busy": now < self._terminal_busy_until,
             "background_terminal_age_seconds": background_age,
             "background_terminal_stale": self._background_terminal_is_stale(now),
@@ -1112,6 +1140,11 @@ class TelegramBridge:
                     self.config.diagnostic_snippet_chars,
                 ),
             )
+        return actions
+
+    def drain_internal_actions(self) -> list[TelegramInput]:
+        actions = self._pending_internal_actions
+        self._pending_internal_actions = []
         return actions
 
     def maybe_forward_output(self, output_buffer: str) -> bool:
@@ -1174,6 +1207,7 @@ class TelegramBridge:
         now = time.monotonic()
         if self._background_terminal_seen_at is None:
             self._background_terminal_seen_at = now
+            self._background_terminal_cleared_at = None
             self._background_terminal_last_log_at = now
             self._background_terminal_stale_notified = False
             self._log_diagnostic(
@@ -1213,6 +1247,7 @@ class TelegramBridge:
         )
         self._background_terminal_seen_at = None
         self._background_terminal_last_seen_at = None
+        self._background_terminal_cleared_at = now
         self._background_terminal_last_log_at = 0.0
         self._background_terminal_stale_notified = False
         self._terminal_busy_until = 0.0
@@ -1301,7 +1336,7 @@ class TelegramBridge:
                     return self._deliver_output(structured_pending, source=source)
             return None
         raw_for_menu = self._remove_injected_prompt_echoes(self._pending_raw_output)
-        raw_for_menu = _remove_recent_user_echoes(raw_for_menu, self._recent_user_inputs)
+        raw_for_menu = _remove_recent_user_echoes(raw_for_menu, self._echo_suppression_inputs())
         if self._maybe_forward_selection_menu(raw_for_menu):
             self._pending_raw_output = ""
             self._pending_output = ""
@@ -1316,7 +1351,7 @@ class TelegramBridge:
         self._last_output_at = None
 
         raw_pending = self._remove_injected_prompt_echoes(raw_pending)
-        raw_pending = _remove_recent_user_echoes(raw_pending, self._recent_user_inputs)
+        raw_pending = _remove_recent_user_echoes(raw_pending, self._echo_suppression_inputs())
         if self._maybe_forward_selection_menu(raw_pending):
             return None
         if self._consume_restore_redraw(raw_pending):
@@ -1373,7 +1408,7 @@ class TelegramBridge:
 
     def _clean_terminal_pending(self, raw_pending: str) -> str:
         pending = _clean_terminal_text(raw_pending).strip()
-        pending = _remove_recent_user_echoes(pending, self._recent_user_inputs)
+        pending = _remove_recent_user_echoes(pending, self._echo_suppression_inputs())
         pending = _clean_terminal_text(pending).strip()
         return pending
 
@@ -1522,6 +1557,12 @@ class TelegramBridge:
         if self._is_cross_source_duplicate(pending, source):
             return None
 
+        if not structured and self._background_summary_output and self.config.auto_summary:
+            self._remember_output_source(pending, source)
+            _append_history_entry(Path(self.config.history_path), pending)
+            self._defer_summary_until_background_quiet(pending)
+            return None
+
         self._remember_output_source(pending, source)
         _append_history_entry(Path(self.config.history_path), pending)
 
@@ -1563,6 +1604,7 @@ class TelegramBridge:
         if first_pending:
             self._background_summary_started_at = now
             self._background_summary_output = pending
+            self._background_summary_ready_wait_last_log_at = 0.0
             self._log_diagnostic(
                 "background_summary_deferred",
                 wait_seconds=self.config.summary_background_wait_seconds,
@@ -1610,6 +1652,8 @@ class TelegramBridge:
         started_at = self._background_summary_started_at or now
         elapsed = now - started_at
         if self._background_terminal_seen_at is None:
+            if not self._background_summary_ready_is_stable(now):
+                return None
             return self._request_background_summary_after_wait(elapsed)
         wait_seconds = self.config.summary_background_wait_seconds
         if wait_seconds <= 0 or elapsed >= wait_seconds:
@@ -1643,6 +1687,24 @@ class TelegramBridge:
             max_chars=self.config.summary_max_chars
         )
 
+    def _background_summary_ready_is_stable(self, now: float) -> bool:
+        stable_seconds = self.config.summary_background_ready_stable_seconds
+        if stable_seconds <= 0:
+            return True
+        if self._background_terminal_cleared_at is None:
+            return True
+        stable_elapsed = now - self._background_terminal_cleared_at
+        if stable_elapsed >= stable_seconds:
+            return True
+        if now - self._background_summary_ready_wait_last_log_at >= 5.0:
+            self._background_summary_ready_wait_last_log_at = now
+            self._log_diagnostic(
+                "background_summary_waiting_for_stable_ready",
+                stable_elapsed_seconds=round(stable_elapsed, 3),
+                stable_seconds=stable_seconds,
+            )
+        return False
+
     def _send_background_summary_timeout_preview(self, elapsed_seconds: float) -> None:
         pending = self._background_summary_output.strip()
         self._clear_background_summary_wait()
@@ -1670,6 +1732,8 @@ class TelegramBridge:
     def _clear_background_summary_wait(self) -> None:
         self._background_summary_output = ""
         self._background_summary_started_at = None
+        self._background_summary_ready_wait_last_log_at = 0.0
+        self._background_terminal_cleared_at = None
 
     def _clear_pending_summary(self) -> None:
         self._awaiting_summary = False
@@ -1736,6 +1800,7 @@ class TelegramBridge:
     def mark_user_input(self, text: str) -> None:
         text = text.strip()
         if text:
+            self._local_input_draft = ""
             self._clear_pending_summary()
             self._clear_background_summary_wait()
             self._pending_auto_continue_prompt = None
@@ -1745,6 +1810,15 @@ class TelegramBridge:
                 self._end_restore_redraw_guard()
             self._recent_user_inputs.append(text)
             self._recent_user_inputs = self._recent_user_inputs[-10:]
+
+    def mark_local_input_draft(self, text: str) -> None:
+        self._local_input_draft = text.strip()
+
+    def _echo_suppression_inputs(self) -> list[str]:
+        inputs = list(self._recent_user_inputs)
+        if len(self._local_input_draft) >= 2:
+            inputs.append(self._local_input_draft)
+        return inputs
 
     def consume_menu_choice(self, text: str) -> TelegramInput | None:
         if self._pending_menu is None:
@@ -1833,13 +1907,15 @@ class TelegramBridge:
                 return
             if self._auto_continue_until is None:
                 self._send_to_allowed_chats(
-                    f"自动推进模式已开启。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}"
+                    f"自动推进模式已开启。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}。"
+                    "遇到默认选中允许项的 approval 请求时，会自动发送 Enter。"
                 )
                 return
             remaining_hours = max(0.0, (self._auto_continue_until - time.monotonic()) / 3600)
             self._send_to_allowed_chats(
                 "自动推进模式已开启，约 "
-                f"{remaining_hours:.2f} 小时后到期。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}"
+                f"{remaining_hours:.2f} 小时后到期。每次模型回复后会发送：{_AUTO_CONTINUE_PROMPT}。"
+                "遇到默认选中允许项的 approval 请求时，会自动发送 Enter。"
             )
             return
         if argument in {"start", "on"}:
@@ -1849,6 +1925,7 @@ class TelegramBridge:
             self._send_to_allowed_chats(
                 f"已开启自动推进模式。会先尝试发送一次：{_AUTO_CONTINUE_PROMPT}。"
                 "之后模型每次回复后也会自动发送。"
+                "遇到默认选中允许项的 approval 请求时，会自动发送 Enter。"
                 "发送 /ta auto end 可关闭。"
             )
             return
@@ -1874,6 +1951,7 @@ class TelegramBridge:
         self._send_to_allowed_chats(
             f"已开启自动推进模式，将在 {hours:g} 小时后自动停止。"
             f"会先尝试发送一次：{_AUTO_CONTINUE_PROMPT}。之后模型每次回复后也会自动发送。"
+            "遇到默认选中允许项的 approval 请求时，会自动发送 Enter。"
             "发送 /ta auto end 可提前关闭。"
         )
 
@@ -2059,6 +2137,8 @@ class TelegramBridge:
         menu = _extract_selection_menu(text)
         if menu is None:
             return False
+        if self._maybe_auto_approve_menu(menu):
+            return True
         if _is_restore_redraw_menu(menu):
             self._begin_restore_redraw_guard()
         if time.monotonic() < self._suppress_menu_until:
@@ -2082,6 +2162,61 @@ class TelegramBridge:
         self._send_to_allowed_chats("\n".join(lines), structured=True)
         return True
 
+    def _maybe_auto_approve_menu(self, menu: SelectionMenu) -> bool:
+        if not self._auto_continue_is_active():
+            return False
+        if not _is_approval_menu(menu):
+            return False
+        selected_option = menu.options[menu.selected_index]
+        if not _looks_like_allow_option(selected_option):
+            self._log_diagnostic(
+                "auto_approval_waiting_for_user",
+                selected_index=menu.selected_index,
+                **_diagnostic_text_fields(
+                    "selected_option",
+                    selected_option,
+                    self.config.diagnostic_snippet_chars,
+                ),
+            )
+            return False
+
+        fingerprint = menu.fingerprint
+        if self._recent_auto_approval_contains(fingerprint):
+            self._pending_menu = None
+            return True
+
+        self._recent_auto_approval_fingerprints[fingerprint] = time.monotonic()
+        self._drop_old_auto_approval_fingerprints()
+        self._pending_menu = None
+        self._sent_menu_fingerprint = fingerprint
+        self._suppress_menu_until = time.monotonic() + _MENU_CHOICE_SUPPRESS_SECONDS
+        self._pending_internal_actions.append(TelegramInput(TelegramInputKind.KEY, "enter"))
+        self._log_diagnostic(
+            "auto_approval_enter_queued",
+            selected_index=menu.selected_index,
+            option_count=len(menu.options),
+            **_diagnostic_text_fields(
+                "selected_option",
+                selected_option,
+                self.config.diagnostic_snippet_chars,
+            ),
+        )
+        self._send_to_allowed_chats(
+            "自动推进模式检测到 approval 请求，已自动发送 Enter 允许当前选项："
+            f"{selected_option}"
+        )
+        return True
+
+    def _recent_auto_approval_contains(self, fingerprint: str) -> bool:
+        self._drop_old_auto_approval_fingerprints()
+        return fingerprint in self._recent_auto_approval_fingerprints
+
+    def _drop_old_auto_approval_fingerprints(self) -> None:
+        cutoff = time.monotonic() - _AUTO_APPROVAL_REPEAT_SUPPRESS_SECONDS
+        for fingerprint, timestamp in list(self._recent_auto_approval_fingerprints.items()):
+            if timestamp < cutoff:
+                self._recent_auto_approval_fingerprints.pop(fingerprint, None)
+
     def _remove_injected_prompt_echoes(self, text: str) -> str:
         for prompt in self._injected_prompts:
             text = text.replace(prompt, "")
@@ -2090,9 +2225,9 @@ class TelegramBridge:
 
     def _clean_forwardable_output(self, text: str) -> str:
         text = self._remove_injected_prompt_echoes(text)
-        text = _remove_recent_user_echoes(text, self._recent_user_inputs)
+        text = _remove_recent_user_echoes(text, self._echo_suppression_inputs())
         text = _clean_terminal_text(text)
-        text = _remove_recent_user_echoes(text, self._recent_user_inputs)
+        text = _remove_recent_user_echoes(text, self._echo_suppression_inputs())
         return _clean_terminal_text(text).strip()
 
     def _make_client(self, token: str) -> TelegramClient | _DebugTelegramClient | None:
@@ -2602,7 +2737,11 @@ def _extract_kimi_sessions_menu(
             header_index = index
             break
     if header_index is None:
-        return None
+        has_sessions_command = bool(raw_text and re.search(r"(?i)(?:^|\s)/sessions\b", raw_text))
+        has_session_meta = any(_is_kimi_session_meta_line(line) for line in normalized)
+        if not has_sessions_command or not has_session_meta:
+            return None
+        header_index = -1
 
     options: list[str] = []
     selected_index: int | None = None
@@ -2611,11 +2750,24 @@ def _extract_kimi_sessions_menu(
         line
         for line in normalized[header_index + 1 : body_end]
         if not re.search(r"(?i)\bsessions\b", line)
+        and not _is_kimi_sessions_control_line(line)
     ]
     index = 0
-    while index + 1 < len(body):
+    while index < len(body):
+        combined = _parse_kimi_session_combined_line(body[index])
+        if combined is not None:
+            title, meta, selected = combined
+            label = f"{title} ({meta})"
+            if label not in options:
+                options.append(label)
+                if selected:
+                    selected_index = len(options) - 1
+            elif selected:
+                selected_index = options.index(label)
+            index += 1
+            continue
+
         title = body[index]
-        meta = body[index + 1]
         selected = False
         selected_title = _parse_selected_menu_option_line(title, allow_weak_markers=True)
         if selected_title is not None:
@@ -2624,10 +2776,22 @@ def _extract_kimi_sessions_menu(
         else:
             title = _normalize_menu_label(title) or ""
 
-        if not title or not _is_kimi_session_meta_line(meta):
+        if not title:
             index += 1
             continue
 
+        meta: str | None = None
+        meta_index = index + 1
+        for candidate_index in range(index + 1, min(index + 4, len(body))):
+            if _parse_kimi_session_combined_line(body[candidate_index]) is not None:
+                break
+            if _is_kimi_session_meta_line(body[candidate_index]):
+                meta = body[candidate_index].strip()
+                meta_index = candidate_index
+                break
+        if meta is None:
+            index += 1
+            continue
         label = f"{title} ({meta})"
         if label not in options:
             options.append(label)
@@ -2635,7 +2799,7 @@ def _extract_kimi_sessions_menu(
                 selected_index = len(options) - 1
         elif selected:
             selected_index = options.index(label)
-        index += 2
+        index = meta_index + 1
 
     if not options:
         return None
@@ -2643,6 +2807,7 @@ def _extract_kimi_sessions_menu(
         expected_count is not None
         and len(options) < min(expected_count, 20)
         and control_index is None
+        and (expected_count <= 20 or len(options) < 3)
     ):
         return None
     if selected_index is None:
@@ -2673,17 +2838,73 @@ def _has_kimi_sessions_context(lines: list[str], raw_text: str) -> bool:
                 flags=re.DOTALL,
             )
         )
+        or (
+            re.search(r"(?i)\bSessions\b", combined)
+            and re.search(_kimi_session_meta_pattern(), combined, flags=re.IGNORECASE)
+        )
+        or (
+            re.search(r"(?i)(?:^|\s)/sessions\b", combined)
+            and len(
+                re.findall(
+                    _kimi_session_meta_pattern(),
+                    combined,
+                    flags=re.IGNORECASE,
+                )
+            )
+            >= 1
+        )
     )
 
 
 def _is_kimi_session_meta_line(line: str) -> bool:
     return bool(
         re.fullmatch(
-            r"\d+\s*(?:s|m|h|d|w|mo|y)\s+ago\s*[·•-]\s*[0-9a-f]{6,}",
+            _kimi_session_meta_pattern(),
             line.strip(),
             flags=re.IGNORECASE,
         )
     )
+
+
+def _kimi_session_meta_pattern() -> str:
+    return (
+        r"(?:just\s+now|\d+\s*(?:secs?|s|mins?|m|hrs?|h|d|w|mo|y)\s+ago)"
+        r"\s*[·•-]\s*[0-9a-f]{6,}(?:-[0-9a-f]{4,})*"
+    )
+
+
+def _is_kimi_sessions_control_line(line: str) -> bool:
+    lowered = line.lower()
+    return bool(
+        ("ctrl+a" in lowered and "show all projects" in lowered)
+        or "enter to select" in lowered
+        or "esc to cancel" in lowered
+        or ("ctrl-" in lowered and "toggle mode" in lowered)
+        or ("ctrl+" in lowered and "toggle mode" in lowered)
+    )
+
+
+def _parse_kimi_session_combined_line(line: str) -> tuple[str, str, bool] | None:
+    selected = False
+    selected_label = _parse_selected_menu_option_line(line, allow_weak_markers=True)
+    if selected_label is not None:
+        normalized = selected_label
+        selected = True
+    else:
+        normalized = _normalize_menu_line(line)
+    normalized = re.sub(r"\s{2,}", " ", normalized).strip()
+    match = re.match(
+        rf"(?P<title>.+?)\s+(?P<meta>{_kimi_session_meta_pattern()})$",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    title = _normalize_menu_label(match.group("title")) or ""
+    meta = _normalize_menu_label(match.group("meta")) or ""
+    if not title or not meta:
+        return None
+    return title, meta, selected
 
 
 def _visible_terminal_text(text: str) -> str:
@@ -3052,7 +3273,10 @@ def _is_low_value_menu_option(label: str) -> bool:
 
 def _looks_like_menu_option_label(label: str) -> bool:
     lowered = label.lower()
-    if re.search(r"\b(gpt|claude|gemini|o[1-9]|llama|mistral|qwen|deepseek)\b", lowered):
+    if re.search(
+        r"\b(gpt|claude|gemini|o[1-9]|llama|mistral|qwen|deepseek|kimi|moonshot)\b",
+        lowered,
+    ):
         return True
     if re.fullmatch(r"(?:low|medium|high|extra high)(?:\s+\([^)]*\))?", lowered):
         return True
@@ -3080,15 +3304,20 @@ def _selection_menu_title(options: list[str]) -> str:
     joined = " ".join(options).lower()
     if (
         "yes, proceed" in joined
+        or "yes, continue" in joined
         or "don't ask again" in joined
         or "tell codex" in joined
         or "approve" in joined
         or "reject" in joined
         or "allow" in joined
         or "deny" in joined
+        or "no, quit" in joined
     ):
         return "请选择是否允许："
-    if "gpt" in joined or "model" in joined or "claude" in joined:
+    if re.search(
+        r"\b(?:gpt|model|claude|gemini|llama|mistral|qwen|deepseek|kimi|moonshot)\b",
+        joined,
+    ):
         return "请选择模型："
     if re.search(r"\b(?:low|medium|high|extra high)\b", joined):
         return "请选择推理强度："
@@ -3097,6 +3326,30 @@ def _selection_menu_title(options: list[str]) -> str:
     if re.search(r"\b\d+\s*(?:s|m|h|d|w|mo|y)\s+ago\b", joined):
         return "请选择会话："
     return "请选择终端菜单项："
+
+
+def _is_approval_menu(menu: SelectionMenu) -> bool:
+    if menu.title == "请选择是否允许：":
+        return True
+    joined = " ".join(menu.options).lower()
+    return bool(
+        "approve" in joined
+        or "allow" in joined
+        or "yes, proceed" in joined
+        or "yes, continue" in joined
+        or "don't ask again" in joined
+    )
+
+
+def _looks_like_allow_option(option: str) -> bool:
+    lowered = option.strip().lower()
+    if re.search(r"\b(?:reject|deny|no,|no\b|cancel|esc)\b", lowered):
+        return False
+    return bool(
+        lowered == "yes"
+        or lowered.startswith(("approve", "allow", "yes, proceed", "yes, continue", "yes,", "yes "))
+        or re.search(r"\b(?:approve|allow|proceed)\b", lowered)
+    )
 
 
 def parse_telegram_input(text: str) -> TelegramInput:
@@ -4087,6 +4340,7 @@ def _is_summary_reply_boundary_line(stripped: str) -> bool:
 
 
 def _format_mobile_layout(text: str) -> str:
+    text = _reflow_markdown_tables_for_mobile(text)
     text = re.sub(r"([：:])\s*-\s*", r"\1\n- ", text)
     text = re.sub(r"([。！？.!?])\s*-\s*", r"\1\n- ", text)
     text = re.sub(r"(?<=[0-9])-\s+(?=[\u4e00-\u9fffA-Za-z])", "\n- ", text)
@@ -4113,8 +4367,7 @@ def _format_mobile_layout(text: str) -> str:
         if _is_bullet_line(line):
             if current:
                 blocks.append(_join_wrapped_lines(current))
-                current = []
-            blocks.append(_normalize_bullet(line))
+            current = [_normalize_bullet(line)]
             continue
         current.append(line)
 
@@ -4126,6 +4379,138 @@ def _format_mobile_layout(text: str) -> str:
     result = re.sub(r"(?m)(^\d+[.)] .*)\n\n(?=\d+[.)] )", r"\1\n", result)
     result = re.sub(r"\n{3,}", "\n\n", result)
     return result.strip()
+
+
+def _reflow_markdown_tables_for_mobile(text: str) -> str:
+    lines = text.splitlines()
+    output: list[str] = []
+    index = 0
+    in_fence = False
+
+    while index < len(lines):
+        stripped = lines[index].strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            output.append(lines[index])
+            index += 1
+            continue
+
+        if (
+            not in_fence
+            and index + 1 < len(lines)
+            and _looks_like_markdown_table_header(lines[index], lines[index + 1])
+        ):
+            headers = _split_markdown_table_row(lines[index])
+            row_index = index + 2
+            rows: list[list[str]] = []
+            while row_index < len(lines):
+                row = lines[row_index]
+                if not row.strip() or not _looks_like_markdown_table_row(row):
+                    break
+                if not _is_markdown_table_separator(row):
+                    rows.append(_split_markdown_table_row(row))
+                row_index += 1
+
+            converted = _format_markdown_table_for_mobile(headers, rows)
+            if converted:
+                if output and output[-1].strip():
+                    output.append("")
+                output.extend(converted)
+                index = row_index
+                continue
+
+        output.append(lines[index])
+        index += 1
+
+    return "\n".join(output)
+
+
+def _looks_like_markdown_table_header(header_line: str, separator_line: str) -> bool:
+    headers = _split_markdown_table_row(header_line)
+    return (
+        len(headers) >= 2
+        and any(header.strip() for header in headers)
+        and _is_markdown_table_separator(separator_line)
+    )
+
+
+def _looks_like_markdown_table_row(line: str) -> bool:
+    return "|" in line and len(_split_markdown_table_row(line)) >= 2
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    cells = _split_markdown_table_row(line)
+    if len(cells) < 2:
+        return False
+    return all(
+        bool(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")))
+        for cell in cells
+        if cell.strip()
+    )
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in stripped:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == "|":
+            cells.append(_clean_markdown_table_cell("".join(current)))
+            current = []
+            continue
+        current.append(char)
+    if escaped:
+        current.append("\\")
+    cells.append(_clean_markdown_table_cell("".join(current)))
+    return cells
+
+
+def _clean_markdown_table_cell(cell: str) -> str:
+    cell = re.sub(r"<br\s*/?>", "；", cell, flags=re.IGNORECASE)
+    cell = re.sub(r"\s+", " ", cell).strip()
+    cell = re.sub(r"^\*\*(.+)\*\*$", r"\1", cell)
+    cell = re.sub(r"^`(.+)`$", r"\1", cell)
+    return cell.strip()
+
+
+def _format_markdown_table_for_mobile(
+    headers: list[str],
+    rows: list[list[str]],
+) -> list[str]:
+    headers = [header or f"列{index + 1}" for index, header in enumerate(headers)]
+    formatted: list[str] = []
+    for row_number, row in enumerate(rows, start=1):
+        cells = row[: len(headers)] + [""] * max(0, len(headers) - len(row))
+        if not any(cell.strip() for cell in cells):
+            continue
+        block: list[str] = []
+        first_header = headers[0] if headers else "项目"
+        first_value = cells[0].strip() if cells else ""
+        if first_value:
+            block.append(f"{row_number}. {first_header}：{first_value}")
+        else:
+            block.append(f"{row_number}. 项目")
+        for column_index, header in enumerate(headers[1:], start=1):
+            value = cells[column_index].strip() if column_index < len(cells) else ""
+            if value:
+                block.append(f"{header}：{value}")
+        if formatted:
+            formatted.append("")
+        formatted.extend(block)
+    return formatted
 
 
 def _extract_transcript_reply(text: str) -> tuple[str, list[str]]:

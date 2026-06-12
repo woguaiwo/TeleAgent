@@ -26,6 +26,7 @@ from teleagent.telegram import (
     _clean_terminal_text,
     _extract_selection_menu,
     _format_for_mobile,
+    _format_structured_for_mobile,
     _remove_recent_user_echoes,
     _terminal_chunk_has_pending_signal,
     _terminal_raw_has_active_status,
@@ -175,6 +176,90 @@ summary_submit_keys = ["enter"]
         self.assertTrue(
             any(
                 "一句话结论：阶段完成。" in str(record.get("text", ""))
+                for record in records
+                if record.get("type") == "message"
+            )
+        )
+
+    def test_debug_auto_approval_enter_reaches_wrapped_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            inbox = tmp_path / "inbox.txt"
+            outbox = tmp_path / "outbox.jsonl"
+            event_log = tmp_path / "events.log"
+            config_path = tmp_path / "teleagent.toml"
+            config_path.write_text(
+                f"""
+[settings]
+default_command = []
+event_log_path = "{event_log}"
+
+[telegram]
+enabled = true
+debug_mode = true
+allowed_chat_ids = [0]
+debug_inbox_path = "{inbox}"
+debug_outbox_path = "{outbox}"
+history_path = "{tmp_path / "history.log"}"
+raw_history_path = "{tmp_path / "raw.log"}"
+idle_forward_seconds = 999
+summary_threshold_chars = 1000
+summary_submit_delay_seconds = 0
+summary_submit_keys = ["enter"]
+""",
+                encoding="utf-8",
+            )
+            script = (
+                "import sys\n"
+                "line = sys.stdin.readline().strip()\n"
+                "print('initial_auto=' + line, flush=True)\n"
+                "sys.stdout.write('\\x1b[9;3HWould you like to run the following command?'"
+                "'\\x1b[14;3H$ true'"
+                "'\\x1b[16;1H› 1. Yes, proceed (y)'"
+                "'\\x1b[17;3H2. No, and tell Codex what to do differently (esc)'"
+                "'\\x1b[20;3HPress enter to confirm or esc to cancel')\n"
+                "sys.stdout.flush()\n"
+                "char = sys.stdin.buffer.read(1)\n"
+                "print('\\napproval_byte=' + str(char[0] if char else -1), flush=True)\n"
+            )
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "teleagent",
+                    "-c",
+                    str(config_path),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    script,
+                ],
+                cwd=ROOT,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            time.sleep(0.5)
+            inbox.write_text("/ta auto start\n", encoding="utf-8")
+            try:
+                output, _ = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                output, _ = process.communicate()
+                self.fail(output)
+
+            records = _read_debug_records(outbox)
+            event_log_text = event_log.read_text(encoding="utf-8")
+
+        self.assertEqual(process.returncode, 0, output)
+        self.assertIn("initial_auto=请继续推进", output)
+        self.assertIn("approval_byte=10", output)
+        self.assertIn("injected -> cli: 请继续推进", event_log_text)
+        self.assertIn("internal -> cli: key 'enter'", event_log_text)
+        self.assertTrue(
+            any(
+                "自动推进模式检测到 approval 请求" in str(record.get("text", ""))
                 for record in records
                 if record.get("type") == "message"
             )
@@ -367,6 +452,10 @@ debug_mode = true
         self.assertIn("telegram.summary_timeout_seconds: 30.0", result.stdout)
         self.assertIn("telegram.summary_fallback_chars: 3500", result.stdout)
         self.assertIn("telegram.summary_background_wait_seconds: 45.0", result.stdout)
+        self.assertIn(
+            "telegram.summary_background_ready_stable_seconds: 15.0",
+            result.stdout,
+        )
         self.assertIn("telegram.background_terminal_timeout_seconds: 600.0", result.stdout)
         self.assertIn("telegram.slash_submit_delay_seconds: 0.2", result.stdout)
         self.assertIn("telegram.slash_submit_keys: ['enter']", result.stdout)
@@ -650,6 +739,7 @@ slash_submit_keys = ["enter"]
 summary_submit_delay_seconds = 0.1
 summary_submit_keys = ["linefeed"]
 summary_background_wait_seconds = 12.0
+summary_background_ready_stable_seconds = 3.5
 background_terminal_timeout_seconds = 12.5
 """
             )
@@ -683,6 +773,7 @@ background_terminal_timeout_seconds = 12.5
         self.assertEqual(config.telegram.summary_timeout_seconds, 30.0)
         self.assertEqual(config.telegram.summary_fallback_chars, 3500)
         self.assertEqual(config.telegram.summary_background_wait_seconds, 12.0)
+        self.assertEqual(config.telegram.summary_background_ready_stable_seconds, 3.5)
         self.assertEqual(config.telegram.background_terminal_timeout_seconds, 12.5)
 
     def test_local_cursor_auto_hide_restores_after_idle(self) -> None:
@@ -1324,6 +1415,39 @@ class TerminalCleanTest(unittest.TestCase):
         self.assertEqual(menu.options, ("gpt-5.5 xhigh", "gpt-5.5 medium", "gpt-5.4-mini"))
         self.assertEqual(menu.selected_index, 0)
 
+    def test_extract_kimi_model_menu_from_tui_lines(self) -> None:
+        raw = (
+            "\x1b[1;1HSelect Model\n"
+            "\x1b[3;1H→ [1] kimi-k2\n"
+            "\x1b[4;1H  [2] kimi-latest\n"
+            "\x1b[5;1H  [3] moonshot-v1\n"
+            "\x1b[7;1HEnter to select · Esc to cancel\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(menu.title, "请选择模型：")
+        self.assertEqual(menu.options, ("kimi-k2", "kimi-latest", "moonshot-v1"))
+        self.assertEqual(menu.selected_index, 0)
+
+    def test_extract_kimi_trust_prompt_as_approval_menu(self) -> None:
+        raw = (
+            "\x1b[1;1HDo you trust the contents of this directory?\n"
+            "\x1b[6;1H› 1. Yes, continue\n"
+            "\x1b[7;3H2. No, quit\n"
+            "\x1b[9;3HPress enter to continue\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(menu.title, "请选择是否允许：")
+        self.assertEqual(menu.options, ("Yes, continue", "No, quit"))
+        self.assertEqual(menu.selected_index, 0)
+
     def test_extract_selection_menu_requires_selected_marker(self) -> None:
         raw = "1. gpt-5\n2. gpt-4\n"
 
@@ -1537,6 +1661,31 @@ class TerminalCleanTest(unittest.TestCase):
 
         self.assertIsNone(_extract_selection_menu(raw))
 
+    def test_extract_kimi_sessions_sends_visible_page_when_total_is_larger(self) -> None:
+        raw = (
+            "SESSIONS (1 of 25)  [all projects]\n"
+            "┌──────────────────────────────────|  Sessions  |───────────────────────────────────┐\n"
+            "│ ❯ WHAM                                                                            │\n"
+            "│   22m ago · c9caecf5                                                              │\n"
+            "│   Novel Team                                                                      │\n"
+            "│   31m ago · 073b7057                                                              │\n"
+            "│   TeleAgent                                                                       │\n"
+            "│   1h ago · 451c3264                                                               │\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(
+            menu.options,
+            (
+                "WHAM (22m ago · c9caecf5)",
+                "Novel Team (31m ago · 073b7057)",
+                "TeleAgent (1h ago · 451c3264)",
+            ),
+        )
+
     def test_extract_kimi_sessions_ignores_post_choice_redraw_noise(self) -> None:
         raw = (
             "┌────────────────────| Sessions |────────────────────┐\n"
@@ -1575,6 +1724,46 @@ class TerminalCleanTest(unittest.TestCase):
             ),
         )
         self.assertNotIn("WHAMago", "\n".join(menu.options))
+
+    def test_extract_kimi_sessions_menu_from_combined_rows(self) -> None:
+        raw = (
+            "SESSIONS (1 of 2)  [current directory]\n"
+            "┌────────────────────────|  Sessions  |────────────────────────┐\n"
+            "│ ❯ WHAM 30m ago · c9caecf5                                   │\n"
+            "│   Novel Team 2h ago · 451c3264                               │\n"
+            "└───────────────────────────────────────────────────────────────┘\n"
+            "ctrl-x: toggle mode | Enter to select | Esc to cancel\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(
+            menu.options,
+            (
+                "WHAM (30m ago · c9caecf5)",
+                "Novel Team (2h ago · 451c3264)",
+            ),
+        )
+        self.assertEqual(menu.selected_index, 0)
+
+    def test_extract_kimi_sessions_menu_without_header_from_sessions_raw(self) -> None:
+        raw = (
+            "/sessions\n"
+            "│ ❯ WHAM                                            │\n"
+            "│   just now · c9caecf5-f0e5-4163-8bf3-e37550277987 │\n"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(
+            menu.options,
+            ("WHAM (just now · c9caecf5-f0e5-4163-8bf3-e37550277987)",),
+        )
+        self.assertEqual(menu.selected_index, 0)
 
     def test_generic_choose_list_is_not_terminal_menu(self) -> None:
         raw = (
@@ -1663,6 +1852,34 @@ class TerminalCleanTest(unittest.TestCase):
         self.assertIn("- 监听终端输出", formatted)
         self.assertIn("- 支持 Telegram", formatted)
         self.assertIn("\n\n", formatted)
+
+    def test_mobile_formatting_reflows_markdown_table(self) -> None:
+        raw = (
+            "| 风险 | 影响程度 | 说明 |\n"
+            "|---|---|---|\n"
+            "| 日志解析不稳定 | 高 | 格式可能变化 |\n"
+            "| 自动摘要过早 | 中 | ready prompt 可能是假结束 |"
+        )
+
+        formatted = _format_for_mobile(raw)
+
+        self.assertNotIn("|---", formatted)
+        self.assertIn("1. 风险：日志解析不稳定", formatted)
+        self.assertIn("影响程度：高", formatted)
+        self.assertIn("说明：格式可能变化", formatted)
+        self.assertIn("2. 风险：自动摘要过早", formatted)
+        self.assertIn("说明：ready prompt 可能是假结束", formatted)
+
+    def test_structured_mobile_formatting_reflows_markdown_table(self) -> None:
+        raw = (
+            "| 文件 | 状态 |\n"
+            "| --- | --- |\n"
+            "| teleagent/telegram.py | 已修改 |"
+        )
+
+        formatted = _format_structured_for_mobile(raw)
+
+        self.assertEqual(formatted, "1. 文件：teleagent/telegram.py\n状态：已修改")
 
     def test_mobile_formatting_removes_summary_prompt_echo(self) -> None:
         raw = (
@@ -2221,7 +2438,9 @@ class TelegramWriteInputTest(unittest.TestCase):
         tracker = _LocalInputTracker()
 
         self.assertEqual(tracker.feed("hi ".encode()), [])
+        self.assertEqual(tracker.current_text, "hi ")
         self.assertEqual(tracker.feed("你好\r".encode()), ["hi 你好"])
+        self.assertEqual(tracker.current_text, "")
 
     def test_local_input_tracker_handles_backspace_and_arrow_keys(self) -> None:
         tracker = _LocalInputTracker()
@@ -2229,6 +2448,7 @@ class TelegramWriteInputTest(unittest.TestCase):
         completed = tracker.feed(b"abc\x7fd\x1b[A\r")
 
         self.assertEqual(completed, ["abd"])
+        self.assertEqual(tracker.current_text, "")
 
     def test_send_uses_configured_submit_keys(self) -> None:
         payload = _capture_written_telegram_input(
@@ -2638,6 +2858,65 @@ class TelegramDebugBridgeTest(unittest.TestCase):
 
         messages = [record["text"] for record in records if record["type"] == "message"]
         self.assertEqual(messages, ["你好，我在。有什么需要我处理的？"])
+
+    def test_local_unsubmitted_draft_echo_is_not_forwarded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.mark_local_input_draft("这只是电脑端未发送草稿")
+                bridge.record_output("\x1b[21;3H› 这只是电脑端未发送草稿")
+                bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(messages, [])
+
+    def test_local_unsubmitted_draft_echo_is_removed_from_real_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.mark_local_input_draft("这只是电脑端未发送草稿")
+                bridge.record_output(
+                    "一句话结论：真正的模型回复。\n"
+                    "\x1b[21;3H› 这只是电脑端未发送草稿"
+                )
+                bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(messages, ["一句话结论：真正的模型回复。"])
 
     def test_terminal_source_can_fall_back_to_kimi_wire_when_ui_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3248,6 +3527,87 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("3. gpt-3", messages[0])
         self.assertNotEqual(messages[0], "Select model ❯ gpt-5 gpt-4 gpt-3")
 
+    def test_debug_bridge_sends_kimi_model_menu_and_routes_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            history = Path(tmp) / "history.log"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(history),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge.record_output(
+                    "\x1b[1;1HSelect Model"
+                    "\x1b[3;1H→ [1] kimi-k2"
+                    "\x1b[4;1H  [2] kimi-latest"
+                    "\x1b[5;1H  [3] moonshot-v1"
+                    "\x1b[7;1HEnter to select · Esc to cancel"
+                )
+                bridge.flush_idle_output()
+                action = bridge.consume_menu_choice("2")
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+            history_text = history.read_text(encoding="utf-8") if history.exists() else ""
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("请选择模型", messages[0])
+        self.assertIn("1. kimi-k2 *", messages[0])
+        self.assertIn("2. kimi-latest", messages[0])
+        self.assertIn("3. moonshot-v1", messages[0])
+        self.assertNotIn("Enter to select", messages[0])
+        self.assertEqual(history_text, "")
+        self.assertEqual(action, TelegramInput(TelegramInputKind.KEY, "down enter"))
+
+    def test_debug_bridge_sends_kimi_trust_prompt_and_auto_can_accept(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "\x1b[1;1HDo you trust the contents of this directory?"
+                    "\x1b[6;1H› 1. Yes, continue"
+                    "\x1b[7;3H2. No, quit"
+                    "\x1b[9;3HPress enter to continue"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [TelegramInput(TelegramInputKind.KEY, "enter")])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("自动推进模式检测到 approval 请求", messages[0])
+        self.assertIn("Yes, continue", messages[0])
+        self.assertNotIn("请选择终端菜单项", messages[0])
+
     def test_debug_bridge_sends_codex_model_tui_as_numbered_choices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             outbox = Path(tmp) / "outbox.jsonl"
@@ -3370,6 +3730,85 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("3. No, and tell Codex", messages[0])
         self.assertEqual(history_text, "")
 
+    def test_auto_mode_auto_approves_codex_approval_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "\x1b[9;3HWould you like to run the following command?"
+                    "\x1b[11;3HReason: 是否允许我终止过慢诊断进程？"
+                    "\x1b[14;3H$ pkill -f diagnose_xsens_to_mocap_bone_chain.py"
+                    "\x1b[16;1H› 1. Yes, proceed (y)"
+                    "\x1b[17;3H2. Yes, and don't ask again for commands that start with "
+                    "`pkill -f diagnose_xsens_to_mocap_bone_chain.py` (p)"
+                    "\x1b[18;3H3. No, and tell Codex what to do differently (esc)"
+                    "\x1b[20;3HPress enter to confirm or esc to cancel"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [TelegramInput(TelegramInputKind.KEY, "enter")])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("自动推进模式检测到 approval 请求", messages[0])
+        self.assertIn("Yes, proceed", messages[0])
+        self.assertNotIn("请选择是否允许", messages[0])
+
+    def test_auto_mode_does_not_submit_reject_selected_approval_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "Would you like to run the following command?\n"
+                    "  1. Yes, proceed (y)\n"
+                    "› 2. No, and tell Codex what to do differently (esc)\n"
+                    "Press enter to confirm or esc to cancel"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("请选择是否允许", messages[0])
+        self.assertIn("2. No, and tell Codex what to do differently (esc) *", messages[0])
+
     def test_extract_kimi_approval_menu_from_boxed_panel(self) -> None:
         raw = (
             "\x1b[0;33m╭─ approval ─────────────────────────╮\x1b[0m\n"
@@ -3406,6 +3845,33 @@ class TelegramDebugBridgeTest(unittest.TestCase):
             ),
         )
         self.assertEqual(menu.selected_index, 0)
+
+    def test_extract_kimi_approval_menu_with_second_option_selected(self) -> None:
+        raw = (
+            "\x1b[0;33m╭─ approval ─────────────────────────╮\x1b[0m\n"
+            "\x1b[0;33m│\x1b[0m  WriteFile is requesting approval to edit file:  "
+            "\x1b[0;33m│\x1b[0m\n"
+            "\x1b[0;33m│\x1b[0m  docs/report.md  "
+            "\x1b[0;33m│\x1b[0m\n"
+            "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [1] Approve once\x1b[0m "
+            "\x1b[0;33m│\x1b[0m\n"
+            "\x1b[0;33m│\x1b[0m \x1b[0;36m→ [2] Approve for this session\x1b[0m "
+            "\x1b[0;33m│\x1b[0m\n"
+            "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [3] Reject\x1b[0m "
+            "\x1b[0;33m│\x1b[0m\n"
+            "\x1b[0;33m╰────────────────────────────────────╯\x1b[0m"
+        )
+
+        menu = _extract_selection_menu(raw)
+
+        self.assertIsNotNone(menu)
+        assert menu is not None
+        self.assertEqual(menu.title, "请选择是否允许：")
+        self.assertEqual(
+            menu.options,
+            ("Approve once", "Approve for this session", "Reject"),
+        )
+        self.assertEqual(menu.selected_index, 1)
 
     def test_debug_bridge_sends_kimi_approval_prompt_without_waiting_for_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3456,6 +3922,143 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("2. Approve for this session", messages[0])
         self.assertIn("3. Reject", messages[0])
         self.assertIn("4. Reject, tell the model", messages[0])
+
+    def test_auto_mode_auto_approves_kimi_approval_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "\x1b[0;33m╭─ approval ─────────────────────────╮\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  Shell is requesting approval to run command:  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  find /data/lyxie/WHAM -maxdepth 3 -type f  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;36m→ [1] Approve once\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [2] Approve for this session\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [3] Reject\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m╰────────────────────────────────────╯\x1b[0m"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [TelegramInput(TelegramInputKind.KEY, "enter")])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("自动推进模式检测到 approval 请求", messages[0])
+        self.assertIn("Approve once", messages[0])
+        self.assertNotIn("请选择是否允许", messages[0])
+
+    def test_auto_mode_auto_approves_kimi_second_allow_option(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "\x1b[0;33m╭─ approval ─────────────────────────╮\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  WriteFile is requesting approval to edit file:  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  docs/report.md  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [1] Approve once\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;36m→ [2] Approve for this session\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [3] Reject\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m╰────────────────────────────────────╯\x1b[0m"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [TelegramInput(TelegramInputKind.KEY, "enter")])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("自动推进模式检测到 approval 请求", messages[0])
+        self.assertIn("Approve for this session", messages[0])
+
+    def test_auto_mode_does_not_auto_approve_kimi_reject_option(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=999,
+                    summary_threshold_chars=1000,
+                )
+            )
+            try:
+                bridge._auto_continue_enabled = True
+                bridge.record_output(
+                    "\x1b[0;33m╭─ approval ─────────────────────────╮\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  Shell is requesting approval to run command:  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m  rm generated.tmp  "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [1] Approve once\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;38;5;244m  [2] Approve for this session\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m│\x1b[0m \x1b[0;36m→ [3] Reject\x1b[0m "
+                    "\x1b[0;33m│\x1b[0m\r\n"
+                    "\x1b[0;33m╰────────────────────────────────────╯\x1b[0m"
+                )
+                bridge.flush_idle_output()
+                actions = bridge.drain_internal_actions()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        messages = [record["text"] for record in records if record["type"] == "message"]
+        self.assertEqual(actions, [])
+        self.assertEqual(len(messages), 1)
+        self.assertIn("请选择是否允许", messages[0])
+        self.assertIn("3. Reject *", messages[0])
+        self.assertNotIn("自动推进模式检测到 approval 请求", messages[0])
 
     def test_debug_bridge_sends_kimi_sessions_as_numbered_choices(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4514,6 +5117,98 @@ class TelegramDebugBridgeTest(unittest.TestCase):
         self.assertIn("准备等待最多 45s", messages[0])
         self.assertIn("如果期间结束，将请求模型生成 800 字以内摘要", messages[0])
         self.assertIn("background terminal 已结束，准备请求模型生成 800 字以内摘要", messages[1])
+
+    def test_background_summary_waits_for_stable_ready_before_requesting_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_timeout_seconds=999,
+                    summary_background_wait_seconds=45,
+                    summary_background_ready_stable_seconds=15,
+                )
+            )
+            try:
+                bridge.record_output(
+                    ("一句话结论：当前任务仍在跑，已经有阶段性结果。" * 12)
+                    + "\n• Working (14m 29s • esc to interrupt) · "
+                    + "1 background terminal running · /ps to view · /stop to close"
+                )
+                first_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_seen_at = None
+                bridge._background_terminal_cleared_at = time.monotonic()
+                early_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_cleared_at = time.monotonic() - 16
+                summary_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNone(early_prompt)
+        self.assertIsNotNone(summary_prompt)
+        self.assertIn("总结成", summary_prompt or "")
+
+    def test_pending_background_summary_merges_new_terminal_output_instead_of_requesting_twice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            outbox = Path(tmp) / "outbox.jsonl"
+            bridge = TelegramBridge(
+                TelegramConfig(
+                    enabled=True,
+                    debug_mode=True,
+                    allowed_chat_ids=(0,),
+                    debug_inbox_path=str(Path(tmp) / "inbox.txt"),
+                    debug_outbox_path=str(outbox),
+                    history_path=str(Path(tmp) / "history.log"),
+                    raw_history_path=str(Path(tmp) / "raw.log"),
+                    idle_forward_seconds=0,
+                    summary_threshold_chars=100,
+                    summary_max_chars=800,
+                    summary_timeout_seconds=999,
+                    summary_background_wait_seconds=45,
+                    summary_background_ready_stable_seconds=15,
+                )
+            )
+            try:
+                bridge.record_output(
+                    ("第一段长输出，后台仍在运行。" * 20)
+                    + "\n• Working (14m 29s • esc to interrupt) · "
+                    + "1 background terminal running · /ps to view · /stop to close"
+                )
+                first_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_seen_at = None
+                bridge._background_terminal_cleared_at = time.monotonic()
+                bridge.record_output("第二段长输出，应该合并进同一个 pending。" * 20)
+                merge_prompt = bridge.flush_idle_output()
+                bridge._background_terminal_cleared_at = time.monotonic() - 16
+                summary_prompt = bridge.flush_idle_output()
+            finally:
+                bridge.close()
+
+            records = _read_debug_records(outbox)
+
+        self.assertIsNone(first_prompt)
+        self.assertIsNone(merge_prompt)
+        self.assertIsNotNone(summary_prompt)
+        self.assertIn("总结成", summary_prompt or "")
+        messages = [str(record["text"]) for record in records if record["type"] == "message"]
+        self.assertEqual(
+            sum("正在请求模型生成 800 字以内摘要" in message for message in messages),
+            0,
+        )
+        self.assertEqual(
+            sum("background terminal 已结束，准备请求模型生成 800 字以内摘要" in message for message in messages),
+            1,
+        )
 
     def test_long_terminal_output_background_wait_timeout_sends_preview(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

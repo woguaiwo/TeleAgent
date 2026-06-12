@@ -97,7 +97,7 @@ Set `settings.default_command` in `teleagent.toml` to run `teleagent` directly:
 buffer_size = 8192
 log_matches = true
 event_log_path = "teleagent-events.log"
-local_cursor_mode = "auto_hide"
+local_cursor_mode = "passthrough"
 local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 ```
@@ -155,7 +155,7 @@ into it. The default project-local token path is `.teleagent/telegram-token`.
 
 ```toml
 [settings]
-local_cursor_mode = "auto_hide"
+local_cursor_mode = "passthrough"
 local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 
@@ -191,6 +191,7 @@ auto_summary = true
 summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
 summary_background_wait_seconds = 45.0
+summary_background_ready_stable_seconds = 15.0
 background_terminal_timeout_seconds = 600.0
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
@@ -222,7 +223,7 @@ Telegram input controls:
 - `/ta rawhistory`: send the raw PTY output file for debugging terminal rendering
 - `/ta diagnostics`: send the structured diagnostics JSONL file
 - `/ta status`: show TeleAgent summary state, including background-terminal state
-- `/ta auto start`: after each model reply, send `请继续推进，并且在合适的时候记录进展在 log 里`
+- `/ta auto start`: after each model reply, send `请继续推进，并且在合适的时候记录进展在 log 里`; approval prompts whose current selection is an allow/approve option are confirmed with Enter
 - `/ta auto 7.5`: enable auto mode for 7.5 hours; very small hour values are valid for testing
 - `/ta auto end`: stop auto mode and wait for user replies again
 - `/ta help`: show TeleAgent control commands
@@ -246,6 +247,11 @@ to mirror that menu to Telegram as numbered choices. Reply with `1`, `2`, `3`,
 and so on to select an item; TeleAgent sends the needed arrow keys and Enter to
 the wrapped CLI. If menu detection misses a case, use `/key up`, `/key down`,
 and `/key enter` for manual control.
+
+In auto mode, approval menus are treated specially: if the currently selected
+option is clearly an allow/approve/proceed option, TeleAgent sends raw Enter to
+the wrapped CLI and sends a short notice to Telegram. If the selected option is
+reject/deny/no, it still sends the menu to Telegram and waits for your choice.
 
 Keep `allowed_chat_ids` strict. Telegram messages from all other chats are
 ignored.
@@ -295,7 +301,8 @@ TeleAgent now supports both full output and summary output:
   compact summary.
 - If long terminal output appears while the CLI reports a background terminal,
   TeleAgent waits up to `summary_background_wait_seconds` before deciding. If
-  the background status clears during that window, it requests a model summary;
+  the background status clears during that window and stays quiet for
+  `summary_background_ready_stable_seconds`, it requests a model summary;
   otherwise it sends a truncated preview and does not inject a summary request.
 - `summary_submit_keys` controls how the injected summary prompt is submitted.
   The default sends Enter and then linefeed because some terminal UIs accept one
@@ -376,17 +383,16 @@ Settings:
 buffer_size = 8192
 log_matches = true
 event_log_path = "teleagent-events.log"
-local_cursor_mode = "auto_hide"
+local_cursor_mode = "passthrough"
 local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 ```
 
-`local_cursor_mode = "auto_hide"` hides the local terminal cursor while the
-wrapped CLI is actively redrawing output, then restores it after a short idle
-period or when local keyboard input arrives. This reduces visible cursor jumps
-from full-screen CLIs. Use `"passthrough"` to keep the wrapped CLI's original
-cursor behavior, or `"hidden"` to keep the local cursor hidden until TeleAgent
-exits.
+`local_cursor_mode = "passthrough"` keeps the wrapped CLI's original local
+terminal cursor behavior. Use `"auto_hide"` to hide the local cursor while the
+wrapped CLI is actively redrawing output, then restore it after a short idle
+period or when local keyboard input arrives. Use `"hidden"` to keep the local
+cursor hidden until TeleAgent exits.
 
 Telegram is configured under `[telegram]` and is disabled by default in the
 public template.

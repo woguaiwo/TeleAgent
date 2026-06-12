@@ -59,7 +59,7 @@ class WrapperConfig:
     buffer_size: int = 8192
     log_matches: bool = True
     event_log_path: str = "teleagent-events.log"
-    local_cursor_mode: str = "auto_hide"
+    local_cursor_mode: str = "passthrough"
     local_cursor_idle_seconds: float = 0.75
     default_command: tuple[str, ...] = ()
     telegram: TelegramConfig = TelegramConfig()
@@ -90,7 +90,7 @@ class WrapperConfig:
         buffer_size = settings.get("buffer_size", 8192)
         log_matches = settings.get("log_matches", True)
         event_log_path = settings.get("event_log_path", "teleagent-events.log")
-        local_cursor_mode = settings.get("local_cursor_mode", "auto_hide")
+        local_cursor_mode = settings.get("local_cursor_mode", "passthrough")
         local_cursor_idle_seconds = settings.get("local_cursor_idle_seconds", 0.75)
         default_command_raw = settings.get("default_command", [])
         if not isinstance(buffer_size, int) or buffer_size < 256:
@@ -218,6 +218,7 @@ def run_wrapped(
                 local_cursor.on_local_input()
                 for completed_input in local_input_tracker.feed(user_input):
                     telegram.mark_user_input(completed_input)
+                telegram.mark_local_input_draft(local_input_tracker.current_text)
                 os.write(master_fd, user_input)
 
             if telegram.enabled and telegram.read_fd in readable:
@@ -244,6 +245,10 @@ def run_wrapped(
                     target="cli_injected",
                 )
                 _submit_injected_prompt(master_fd, injected_prompt, config.telegram)
+            for action in telegram.drain_internal_actions():
+                _log_event(config, f"internal -> cli: {_describe_telegram_input(action)}")
+                telegram.log_input_action(action, target="cli_internal")
+                _write_telegram_input(master_fd, action, config.telegram)
             local_cursor.on_tick()
     finally:
         telegram.close()
@@ -345,6 +350,10 @@ class _LocalInputTracker:
         elif len(self._escape_sequence) > 16:
             self._escape_sequence = ""
         return True
+
+    @property
+    def current_text(self) -> str:
+        return self._buffer
 
 
 class _LocalCursorController:

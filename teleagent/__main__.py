@@ -21,7 +21,7 @@ DEFAULT_PROJECT_CONFIG = """
 buffer_size = 8192
 log_matches = true
 event_log_path = "teleagent-events.log"
-local_cursor_mode = "auto_hide"
+local_cursor_mode = "passthrough"
 local_cursor_idle_seconds = 0.75
 default_command = ["codex"]
 
@@ -57,6 +57,7 @@ auto_summary = true
 summary_timeout_seconds = 30.0
 summary_fallback_chars = 3500
 summary_background_wait_seconds = 45.0
+summary_background_ready_stable_seconds = 15.0
 background_terminal_timeout_seconds = 600.0
 input_submit_delay_seconds = 0.05
 input_submit_keys = ["enter", "linefeed"]
@@ -536,6 +537,10 @@ def _print_doctor(config_path: Path, config: WrapperConfig, command: list[str]) 
     print(f"telegram.summary_timeout_seconds: {telegram.summary_timeout_seconds}")
     print(f"telegram.summary_fallback_chars: {telegram.summary_fallback_chars}")
     print(f"telegram.summary_background_wait_seconds: {telegram.summary_background_wait_seconds}")
+    print(
+        "telegram.summary_background_ready_stable_seconds: "
+        f"{telegram.summary_background_ready_stable_seconds}"
+    )
     print(
         "telegram.background_terminal_timeout_seconds: "
         f"{telegram.background_terminal_timeout_seconds}"
